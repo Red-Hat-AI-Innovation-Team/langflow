@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 
@@ -61,10 +60,16 @@ class MCPToolsComponent(ComponentWithCache):
         self._ensure_cache_structure()
 
         # Initialize clients with access to the component cache
-        self.stdio_client: MCPStdioClient = MCPStdioClient(component_cache=self._shared_component_cache)
+        self.stdio_client: MCPStdioClient = MCPStdioClient(
+            component_cache=self._shared_component_cache
+        )
         self.streamable_http_client: MCPStreamableHttpClient = MCPStreamableHttpClient(
             component_cache=self._shared_component_cache
         )
+
+        # OAuth state
+        self._oauth_token: str | None = None
+        self._oauth_client = None
 
     def _ensure_cache_structure(self):
         """Ensure the cache has the required structure."""
@@ -78,6 +83,63 @@ class MCPToolsComponent(ComponentWithCache):
         if last_server_value is None:
             safe_cache_set(self._shared_component_cache, "last_selected_server", "")
 
+    async def _get_oauth_token(self, oauth_url: str) -> str | None:
+        """Get OAuth token using browser flow with SharedTokenStorage.
+
+        Uses MCPOAuthClient to handle:
+        - PKCE-based OAuth flow
+        - Browser-based authentication
+        - Token caching with SharedTokenStorage
+        - Token refresh when expired
+
+        Args:
+            oauth_url: OAuth authorization server base URL
+
+        Returns:
+            Access token string, or None if authentication fails
+        """
+        try:
+            # Import OAuth client (follows MCP Import Pattern from CLAUDE.md)
+            try:
+                from redhat_agents.auth.mcp_oauth import MCPOAuthClient
+            except ImportError:
+                raise ImportError(
+                    "MCPOAuthClient not found, please ensure the redhat_agents package is installed."
+                )
+
+            from urllib.parse import urlparse
+
+            # Create unique client name based on URL for separate token storage
+            parsed = urlparse(oauth_url)
+            client_name = f"mcp_{parsed.netloc.replace('.', '_').replace(':', '_')}"
+
+            # Create OAuth client (uses SharedTokenStorage by default)
+            oauth_client = MCPOAuthClient(client_name)
+            oauth_client.auth_url = oauth_url
+
+            oauth_config = {
+                "verify_ssl": getattr(self, "verify_ssl", True),
+                "scope": "session:role-any",
+            }
+
+            await logger.ainfo(f"Starting OAuth flow for {client_name}")
+
+            # get_access_token will:
+            # 1. Check SharedTokenStorage for cached valid token
+            # 2. Try token refresh if token expired but has refresh_token
+            # 3. Open browser for new OAuth flow if no valid token
+            access_token = await oauth_client.get_access_token(oauth_config)
+
+            await logger.ainfo(f"OAuth token obtained for {client_name}")
+
+            # Store OAuth client for potential token refresh
+            self._oauth_client = oauth_client
+            return access_token
+
+        except Exception as e:
+            await logger.aerror(f"OAuth failed: {e}")
+            return None
+
     default_keys: list[str] = [
         "code",
         "_type",
@@ -87,6 +149,8 @@ class MCPToolsComponent(ComponentWithCache):
         "tool",
         "use_cache",
         "verify_ssl",
+        "enable_oauth",
+        "oauth_url",
     ]
 
     display_name = "MCP Tools"
@@ -121,6 +185,23 @@ class MCPToolsComponent(ComponentWithCache):
             ),
             value=True,
             advanced=True,
+        ),
+        BoolInput(
+            name="enable_oauth",
+            display_name="Enable OAuth",
+            info="Enable OAuth authentication for HTTP-based MCP servers.",
+            value=False,
+            advanced=True,
+            real_time_refresh=True,
+        ),
+        MessageTextInput(
+            name="oauth_url",
+            display_name="OAuth URL",
+            info="OAuth authorization server base URL (e.g., https://mcp.server.com/auth)",
+            value="",
+            show=False,
+            required=False,
+            real_time_refresh=True,
         ),
         DropdownInput(
             name="tool",
@@ -258,12 +339,69 @@ class MCPToolsComponent(ComponentWithCache):
                 verify_ssl = getattr(self, "verify_ssl", True)
                 server_config["verify_ssl"] = verify_ssl
 
-            _, tool_list, tool_cache = await update_tools(
-                server_name=server_name,
-                server_config=server_config,
-                mcp_stdio_client=self.stdio_client,
-                mcp_streamable_http_client=self.streamable_http_client,
+            # Inject OAuth Authorization header if enabled (HTTP mode only)
+            enable_oauth = getattr(self, "enable_oauth", False)
+            oauth_token = getattr(self, "_oauth_token", None)
+            oauth_url = getattr(self, "oauth_url", "")
+
+            # If OAuth is enabled but no token in instance, try to retrieve from storage
+            if enable_oauth and not oauth_token and oauth_url:
+                await logger.ainfo(f"No cached token, attempting OAuth for: {oauth_url}")
+                oauth_token = await self._get_oauth_token(oauth_url)
+                if oauth_token:
+                    self._oauth_token = oauth_token
+                    await logger.ainfo("OAuth token retrieved successfully from storage/flow")
+
+            await logger.ainfo(
+                f"OAuth status for {server_name}: enabled={enable_oauth}, "
+                f"token_present={oauth_token is not None}, "
+                f"url={server_config.get('url', 'N/A')}"
             )
+
+            if enable_oauth and oauth_token:
+                # Only inject for HTTP-based servers (not Stdio)
+                mode = server_config.get("mode", "")
+                is_http_mode = mode in ("Streamable_HTTP", "SSE") or (
+                    "url" in server_config and "command" not in server_config
+                )
+                if is_http_mode:
+                    if "headers" not in server_config:
+                        server_config["headers"] = {}
+                    server_config["headers"]["Authorization"] = f"Bearer {oauth_token}"
+                    await logger.ainfo(
+                        f"OAuth Authorization header injected into MCP config for URL: "
+                        f"{server_config.get('url', 'unknown')}"
+                    )
+                else:
+                    await logger.awarning(
+                        "OAuth enabled but server is not HTTP-based, skipping header injection"
+                    )
+
+            try:
+                _, tool_list, tool_cache = await update_tools(
+                    server_name=server_name,
+                    server_config=server_config,
+                    mcp_stdio_client=self.stdio_client,
+                    mcp_streamable_http_client=self.streamable_http_client,
+                )
+            except Exception as tool_error:
+                # Extract sub-exceptions from TaskGroup/ExceptionGroup errors
+                actual_errors = []
+                if hasattr(tool_error, "exceptions"):
+                    # ExceptionGroup (Python 3.11+)
+                    for sub_exc in tool_error.exceptions:
+                        actual_errors.append(f"{type(sub_exc).__name__}: {sub_exc}")
+                elif hasattr(tool_error, "__cause__") and tool_error.__cause__:
+                    actual_errors.append(
+                        f"Cause: {type(tool_error.__cause__).__name__}: {tool_error.__cause__}"
+                    )
+
+                if actual_errors:
+                    await logger.aerror(
+                        f"MCP connection failed for {server_name}. "
+                        f"Root causes: {'; '.join(actual_errors)}"
+                    )
+                raise
 
             self.tool_names = [tool.name for tool in tool_list if hasattr(tool, "name")]
             self._tool_cache = tool_cache
@@ -284,11 +422,21 @@ class MCPToolsComponent(ComponentWithCache):
                     current_servers_cache[server_name] = cache_data
                     safe_cache_set(self._shared_component_cache, "servers", current_servers_cache)
 
-        except (TimeoutError, asyncio.TimeoutError) as e:
+        except TimeoutError as e:
             msg = f"Timeout updating tool list: {e!s}"
             await logger.aexception(msg)
             raise TimeoutError(msg) from e
         except Exception as e:
+            # Check for authentication errors - clear OAuth token to force re-authentication
+            error_str = str(e).lower()
+            if ("401" in error_str or "unauthorized" in error_str) and getattr(
+                self, "enable_oauth", False
+            ):
+                self._oauth_token = None
+                await logger.awarning(
+                    "401 Unauthorized - clearing OAuth token for re-authentication"
+                )
+
             msg = f"Error updating tool list: {e!s}"
             await logger.aexception(msg)
             raise ValueError(msg) from e
@@ -308,7 +456,7 @@ class MCPToolsComponent(ComponentWithCache):
                             self.tools, build_config["mcp_server"]["value"] = await self.update_tool_list()
                             build_config["tool"]["options"] = [tool.name for tool in self.tools]
                             build_config["tool"]["placeholder"] = "Select a tool"
-                        except (TimeoutError, asyncio.TimeoutError) as e:
+                        except TimeoutError as e:
                             msg = f"Timeout updating tool list: {e!s}"
                             await logger.aexception(msg)
                             if not build_config["tools_metadata"]["show"]:
@@ -468,6 +616,53 @@ class MCPToolsComponent(ComponentWithCache):
                     build_config["tool"]["placeholder"] = "Loading tools..."
             elif field_name == "tools_metadata":
                 self._not_load_actions = False
+
+            elif field_name == "enable_oauth":
+                # Toggle oauth_url visibility based on enable_oauth toggle
+                if field_value:
+                    # Show oauth_url and make it required
+                    build_config["oauth_url"]["show"] = True
+                    build_config["oauth_url"]["required"] = True
+                    build_config["oauth_url"]["advanced"] = False
+                else:
+                    # Hide oauth_url and make it not required
+                    build_config["oauth_url"]["show"] = False
+                    build_config["oauth_url"]["required"] = False
+                    build_config["oauth_url"]["advanced"] = True
+                    build_config["oauth_url"]["value"] = ""
+                    # Clear OAuth token when OAuth is disabled
+                    self._oauth_token = None
+                    self._oauth_client = None
+
+            elif field_name == "oauth_url":
+                # Trigger OAuth authentication when oauth_url is pasted
+                if field_value and getattr(self, "enable_oauth", False):
+                    from urllib.parse import urlparse
+
+                    # Validate URL format first
+                    parsed = urlparse(field_value)
+                    if not parsed.scheme or not parsed.netloc:
+                        build_config["oauth_url"]["placeholder"] = "Invalid URL format"
+                        await logger.awarning(f"Invalid OAuth URL format: {field_value}")
+                        return build_config
+
+                    # Trigger OAuth flow (async)
+                    await logger.ainfo(f"Initiating OAuth for URL: {field_value}")
+                    token = await self._get_oauth_token(field_value)
+
+                    if token:
+                        self._oauth_token = token
+                        build_config["oauth_url"]["placeholder"] = "Authenticated successfully"
+                        await logger.ainfo("OAuth authentication successful")
+                        # Clear cached tools to force refresh with new auth token
+                        self.tools = []
+                    else:
+                        build_config["oauth_url"]["placeholder"] = "Authentication failed"
+                        await logger.awarning("OAuth authentication returned no token")
+                elif not field_value:
+                    # URL cleared - reset OAuth state
+                    self._oauth_token = None
+                    build_config["oauth_url"]["placeholder"] = ""
 
         except Exception as e:
             msg = f"Error in update_build_config: {e!s}"
