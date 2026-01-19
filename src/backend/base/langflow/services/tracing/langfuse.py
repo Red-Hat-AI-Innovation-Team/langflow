@@ -61,8 +61,15 @@ class LangFuseTracer(BaseTracer):
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"can not connect to Langfuse: {e}")
                 return False
+
+            # Use hex format (no dashes) to match LangFuse's internal format
+            if hasattr(self.trace_id, 'hex'):
+                trace_id_str = self.trace_id.hex
+            else:
+                trace_id_str = str(self.trace_id).replace('-', '')
+
             self.trace = self._client.trace(
-                id=str(self.trace_id),
+                id=trace_id_str,
                 name=self.flow_id,
                 user_id=self.user_id,
                 session_id=self.session_id,

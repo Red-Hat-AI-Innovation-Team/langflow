@@ -345,6 +345,7 @@ class SimplifiedAPIRequest(BaseModel):
     )
     tweaks: Tweaks | None = Field(default=None, description="The tweaks")
     session_id: str | None = Field(default=None, description="The session id")
+    run_id: str | None = Field(default=None, description="Trace/run ID for observability linking")
 
 
 # (alias) type ReactFlowJsonObject<NodeData = any, EdgeData = any> = {

@@ -427,7 +427,14 @@ async def _run_flow_internal(
             media_type="text/event-stream",
         )
 
-    run_id = str(uuid4())
+    # Use provided run_id for trace linking, or generate new UUID
+    if input_request and input_request.run_id:
+        run_id = input_request.run_id
+        logger.info(f"[LANGFLOW-TRACING] Using provided run_id: {run_id}")
+    else:
+        run_id = str(uuid4())
+        logger.info(f"[LANGFLOW-TRACING] Generated new run_id: {run_id}")
+
     try:
         result = await simple_run_flow(
             flow=flow,
