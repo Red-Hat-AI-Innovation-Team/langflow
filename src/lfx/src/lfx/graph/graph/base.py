@@ -638,17 +638,23 @@ class Graph:
             run_id = uuid.uuid4()
 
         self._run_id = str(run_id)
+        logger.info(f"[LANGFLOW-TRACING] Graph.set_run_id called with: {run_id}, stored as: {self._run_id}")
 
     async def initialize_run(self) -> None:
         if not self._run_id:
             self.set_run_id()
         if self.tracing_service:
             run_name = f"{self.flow_name} - {self.flow_id}"
+            # Get parent_observation_id from context for nested trace hierarchy
+            parent_observation_id = self._context.get("parent_observation_id") if self._context else None
+            run_id_uuid = uuid.UUID(self._run_id)
+            logger.info(f"[LANGFLOW-TRACING] Graph.initialize_run with _run_id: {self._run_id}, uuid: {run_id_uuid}")
             await self.tracing_service.start_tracers(
-                run_id=uuid.UUID(self._run_id),
+                run_id=run_id_uuid,
                 run_name=run_name,
                 user_id=self.user_id,
                 session_id=self.session_id,
+                parent_observation_id=parent_observation_id,
             )
 
     def _end_all_traces_async(self, outputs: dict[str, Any] | None = None, error: Exception | None = None) -> None:

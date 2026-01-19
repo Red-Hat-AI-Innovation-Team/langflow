@@ -71,12 +71,14 @@ class TraceContext:
         project_name: str | None,
         user_id: str | None,
         session_id: str | None,
+        parent_observation_id: str | None = None,
     ):
         self.run_id: UUID | None = run_id
         self.run_name: str | None = run_name
         self.project_name: str | None = project_name
         self.user_id: str | None = user_id
         self.session_id: str | None = session_id
+        self.parent_observation_id: str | None = parent_observation_id
         self.tracers: dict[str, BaseTracer] = {}
         self.all_inputs: dict[str, dict] = defaultdict(dict)
         self.all_outputs: dict[str, dict] = defaultdict(dict)
@@ -181,6 +183,7 @@ class TracingService(Service):
             trace_id=trace_context.run_id,
             user_id=trace_context.user_id,
             session_id=trace_context.session_id,
+            parent_observation_id=trace_context.parent_observation_id,
         )
 
     def _initialize_arize_phoenix_tracer(self, trace_context: TraceContext) -> None:
@@ -227,6 +230,7 @@ class TracingService(Service):
         user_id: str | None,
         session_id: str | None,
         project_name: str | None = None,
+        parent_observation_id: str | None = None,
     ) -> None:
         """Start a trace for a graph run.
 
@@ -237,8 +241,12 @@ class TracingService(Service):
         if self.deactivated:
             return
         try:
+            await logger.ainfo(f"[LANGFLOW-TRACING] start_tracers called with run_id: {run_id}")
+            await logger.ainfo(f"[LANGFLOW-TRACING] start_tracers parent_observation_id: {parent_observation_id}")
             project_name = project_name or os.getenv("LANGCHAIN_PROJECT", "Langflow")
-            trace_context = TraceContext(run_id, run_name, project_name, user_id, session_id)
+            trace_context = TraceContext(
+                run_id, run_name, project_name, user_id, session_id, parent_observation_id
+            )
             trace_context_var.set(trace_context)
             await self._start(trace_context)
             self._initialize_langsmith_tracer(trace_context)
