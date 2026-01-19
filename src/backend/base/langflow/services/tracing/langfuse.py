@@ -32,7 +32,6 @@ class LangFuseTracer(BaseTracer):
         trace_id: UUID,
         user_id: str | None = None,
         session_id: str | None = None,
-        parent_observation_id: str | None = None,
     ) -> None:
         self.project_name = project_name
         self.trace_name = trace_name
@@ -40,7 +39,6 @@ class LangFuseTracer(BaseTracer):
         self.trace_id = trace_id
         self.user_id = user_id
         self.session_id = session_id
-        self.parent_observation_id = parent_observation_id
         self.flow_id = trace_name.split(" - ")[-1]
         self.spans: dict = OrderedDict()  # spans that are not ended
 
@@ -64,87 +62,28 @@ class LangFuseTracer(BaseTracer):
                 logger.debug(f"can not connect to Langfuse: {e}")
                 return False
 
-            # CRITICAL: Use hex format (no dashes) for trace_id to match LangFuse's internal format
-            # LangFuse stores trace IDs as 32-char hex strings, not UUID format with dashes
-            # The experiment creates traces with hex IDs like "744bc58d0e442e8aefe5c30d41008bb3"
-            # If we use UUID format "744bc58d-0e44-2e8a-efe5-c30d41008bb3", LangFuse won't find the trace
+            # Use hex format (no dashes) to match LangFuse's internal format
             if hasattr(self.trace_id, 'hex'):
-                trace_id_str = self.trace_id.hex  # UUID object -> 32 char hex string
+                trace_id_str = self.trace_id.hex
             else:
-                trace_id_str = str(self.trace_id).replace('-', '')  # String with dashes -> hex string
+                trace_id_str = str(self.trace_id).replace('-', '')
 
-            # If parent_observation_id is provided, we're nesting under an existing experiment trace
-            # In this case, we should NOT create a new trace - just verify parent exists and create spans
-            if self.parent_observation_id:
-                logger.info(f"[LANGFLOW-TRACING] Parent observation mode - trace_id: {trace_id_str}")
-                logger.info(f"[LANGFLOW-TRACING] Attempting to nest under parent: {self.parent_observation_id}")
-
-                # Verify parent observation exists by fetching it
-                parent_exists = self._verify_parent_observation_exists(trace_id_str)
-                if parent_exists:
-                    logger.info(f"[LANGFLOW-TRACING] SUCCESS: Parent observation verified in LangFuse")
-                else:
-                    logger.warning(f"[LANGFLOW-TRACING] WARNING: Could not verify parent observation exists")
-
-                # Get reference to existing trace (don't create new one with different metadata)
-                # Using trace() with just the ID connects to existing trace
-                self.trace = self._client.trace(id=trace_id_str)
-
-                # Create root span as child of the parent observation
-                # This is the key: parent_observation_id links this span to the experiment's observation
-                self._root_span = self.trace.span(
-                    name=f"Langflow: {self.flow_id}",
-                    parent_observation_id=self.parent_observation_id,
-                )
-                logger.info(f"[LANGFLOW-TRACING] Created root span '{self._root_span.id}' under parent observation")
-            else:
-                # Original behavior - create our own trace
-                logger.info(f"[LANGFLOW-TRACING] Standalone mode - creating new trace: {trace_id_str}")
-                self.trace = self._client.trace(
-                    id=trace_id_str,
-                    name=self.flow_id,
-                    user_id=self.user_id,
-                    session_id=self.session_id,
-                )
-                self._root_span = None
+            self.trace = self._client.trace(
+                id=trace_id_str,
+                name=self.flow_id,
+                user_id=self.user_id,
+                session_id=self.session_id,
+            )
 
         except ImportError:
             logger.exception("Could not import langfuse. Please install it with `pip install langfuse`.")
             return False
 
         except Exception as e:  # noqa: BLE001
-            logger.debug(f"Error setting up LangFuse tracer: {e}")
+            logger.debug(f"Error setting up LangSmith tracer: {e}")
             return False
 
         return True
-
-    def _verify_parent_observation_exists(self, trace_id: str) -> bool:
-        """Verify that the parent observation exists in LangFuse.
-
-        This helps debug timing issues where Langflow tries to nest under
-        an observation that hasn't been flushed to LangFuse yet.
-        """
-        try:
-            # Try to fetch the trace to verify it exists
-            trace_data = self._client.fetch_trace(trace_id)
-            if trace_data:
-                logger.info(f"[LANGFLOW-TRACING] Trace exists with {len(trace_data.observations or [])} observations")
-                # Check if parent_observation_id is in the observations
-                if trace_data.observations:
-                    obs_ids = [obs.id for obs in trace_data.observations]
-                    if self.parent_observation_id in obs_ids:
-                        logger.info(f"[LANGFLOW-TRACING] Parent observation {self.parent_observation_id} found in trace")
-                        return True
-                    else:
-                        logger.warning(f"[LANGFLOW-TRACING] Parent observation NOT in trace. Available: {obs_ids[:5]}")
-                        return False
-                else:
-                    logger.warning(f"[LANGFLOW-TRACING] Trace exists but has no observations yet")
-                    return False
-            return False
-        except Exception as e:
-            logger.warning(f"[LANGFLOW-TRACING] Could not verify parent observation: {e}")
-            return False
 
     @override
     def add_trace(
@@ -172,10 +111,12 @@ class LangFuseTracer(BaseTracer):
             "start_time": start_time,
         }
 
-        # If we have a root span (from parent_observation_id), create spans under it
-        # Otherwise create spans directly under the trace
-        parent = self._root_span if self._root_span else self.trace
-        span = parent.span(**serialize(content_span))
+        # if two component is built concurrently, will use wrong last span. just flatten now, maybe fix in future.
+        # if len(self.spans) > 0:
+        #     last_span = next(reversed(self.spans))
+        #     span = self.spans[last_span].span(**content_span)
+        # else:
+        span = self.trace.span(**serialize(content_span))
 
         self.spans[trace_id] = span
 
@@ -216,23 +157,14 @@ class LangFuseTracer(BaseTracer):
             "output": outputs,
             "metadata": metadata,
         }
-        # End the root span if it exists
-        if self._root_span:
-            self._root_span.update(**serialize(content_update))
-            self._root_span.end()
         self.trace.update(**serialize(content_update))
 
     def get_langchain_callback(self) -> BaseCallbackHandler | None:
         if not self._ready:
             return None
 
-        # get callback from parent span, preferring root_span if it exists
-        if len(self.spans) > 0:
-            stateful_client = self.spans[next(reversed(self.spans))]
-        elif self._root_span:
-            stateful_client = self._root_span
-        else:
-            stateful_client = self.trace
+        # get callback from parent span
+        stateful_client = self.spans[next(reversed(self.spans))] if len(self.spans) > 0 else self.trace
         return stateful_client.get_langchain_handler()
 
     @staticmethod

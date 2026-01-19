@@ -435,14 +435,6 @@ async def _run_flow_internal(
         run_id = str(uuid4())
         logger.info(f"[LANGFLOW-TRACING] Generated new run_id: {run_id}")
 
-    # Add parent_observation_id to context for nested trace hierarchy
-    if input_request and input_request.parent_observation_id:
-        if context is None:
-            context = {}
-        else:
-            context = context.copy()
-        context["parent_observation_id"] = input_request.parent_observation_id
-        logger.info(f"[LANGFLOW-TRACING] Using parent_observation_id: {input_request.parent_observation_id}")
     try:
         result = await simple_run_flow(
             flow=flow,
