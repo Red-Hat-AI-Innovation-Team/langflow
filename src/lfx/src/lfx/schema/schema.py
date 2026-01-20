@@ -142,7 +142,7 @@ class BuildStatus(BaseModel):
 
 class InputValueRequest(BaseModel):
     components: list[str] | None = []
-    input_value: str | None = None
+    input_value: str | dict | list | None = None
     session: str | None = None
     type: InputType | None = Field(
         "any",

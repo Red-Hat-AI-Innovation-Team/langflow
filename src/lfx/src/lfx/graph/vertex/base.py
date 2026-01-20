@@ -353,11 +353,12 @@ class Vertex:
         self.load_from_db_fields = load_from_db_fields
         self.raw_params = self.params.copy()
 
-    def update_raw_params(self, new_params: Mapping[str, str | list[str]], *, overwrite: bool = False) -> None:
+    def update_raw_params(self, new_params: Mapping[str, Any], *, overwrite: bool = False) -> None:
         """Update the raw parameters of the vertex with the given new parameters.
 
         Args:
-            new_params (Dict[str, Any]): The new parameters to update.
+            new_params (Mapping[str, Any]): The new parameters to update. Values can be
+                strings, lists, Data objects, DataFrame objects, or other Langflow types.
             overwrite (bool, optional): Whether to overwrite the existing parameters.
                 Defaults to False.
 

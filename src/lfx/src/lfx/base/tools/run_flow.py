@@ -17,6 +17,7 @@ from lfx.helpers import get_flow_inputs, run_flow
 from lfx.inputs.inputs import BoolInput, DropdownInput, InputTypes, MessageTextInput, StrInput
 from lfx.log.logger import logger
 from lfx.schema.data import Data
+from lfx.schema.dataframe import DataFrame
 from lfx.schema.dotdict import dotdict
 from lfx.services.cache.utils import CacheMiss
 from lfx.services.deps import get_shared_component_cache_service
@@ -164,9 +165,116 @@ class RunFlowBaseComponent(Component):
     ################################################################
     # Flow inputs/config
     ################################################################
+    def _get_data_entry_vertices(self, graph: Graph) -> list[tuple[Vertex, list[str]]]:
+        """Find vertices with unconnected required DataFrame/Data inputs.
+
+        Scans all vertices in the graph for inputs that:
+        - Have input_types containing "DataFrame" or "Data"
+        - Are marked as required=True
+        - Are NOT connected (no incoming edge to that input)
+
+        Args:
+            graph: The graph to scan for data entry points.
+
+        Returns:
+            List of tuples (vertex, [field_names]) for vertices with unconnected data inputs.
+        """
+        data_entry_vertices: list[tuple[Vertex, list[str]]] = []
+        data_input_types = {"DataFrame", "Data"}
+
+        # Build a set of connected inputs: (target_vertex_id, field_name)
+        connected_inputs: set[tuple[str, str]] = set()
+        for edge in graph.edges:
+            target_id = edge.target_id
+            field_name = edge.target_handle.field_name if hasattr(edge, "target_handle") else None
+            if field_name:
+                connected_inputs.add((target_id, field_name))
+
+        for vertex in graph.vertices:
+            if vertex.is_input:
+                continue
+
+            field_template = vertex.data.get("node", {}).get("template", {})
+            unconnected_data_fields: list[str] = []
+
+            for field_name, field_config in field_template.items():
+                if not isinstance(field_config, dict):
+                    continue
+
+                input_types = field_config.get("input_types", [])
+                has_data_type = any(t in data_input_types for t in input_types)
+                if not has_data_type:
+                    continue
+
+                is_required = field_config.get("required", False)
+                if not is_required:
+                    continue
+
+                is_connected = (vertex.id, field_name) in connected_inputs
+                if is_connected:
+                    continue
+
+                unconnected_data_fields.append(field_name)
+
+            if unconnected_data_fields:
+                data_entry_vertices.append((vertex, unconnected_data_fields))
+
+        return data_entry_vertices
+
+    def _get_data_fields_from_vertex(
+        self, vertex: Vertex, field_names: list[str], vdisp_cts: dict[str, int]
+    ) -> list[dotdict]:
+        """Extract only specific fields from a vertex for data entry points."""
+        field_template = vertex.data.get("node", {}).get("template", {})
+        fields: list[dotdict] = []
+
+        for field_name in field_names:
+            if field_name not in field_template:
+                continue
+
+            field_config = field_template[field_name]
+            if not isinstance(field_config, dict):
+                continue
+
+            display_name = field_config.get("display_name", field_name)
+            if vdisp_cts.get(vertex.display_name, 1) == 1:
+                full_display_name = f"{display_name} ({vertex.display_name})"
+            else:
+                full_display_name = f"{display_name} ({vertex.display_name}-{vertex.id.split('-')[-1]})"
+
+            fields.append(
+                dotdict(
+                    {
+                        **field_config,
+                        "name": self._get_ioput_name(vertex.id, field_name),
+                        "display_name": full_display_name,
+                        "tool_mode": not field_config.get("advanced", False),
+                    }
+                )
+            )
+
+        return fields
+
     def get_new_fields_from_graph(self, graph: Graph) -> list[dotdict]:
+        # Get standard input components (ChatInput, TextInput, etc.)
         inputs = get_flow_inputs(graph)
-        return self.get_new_fields(inputs)
+
+        # Also get data entry points (components with unconnected required DataFrame/Data inputs)
+        data_entry_vertices = self._get_data_entry_vertices(graph)
+
+        # Build display name counter for all vertices
+        all_vertices = list(inputs) + [v for v, _ in data_entry_vertices]
+        vdisp_cts = Counter(v.display_name for v in all_vertices)
+
+        # Get fields from standard input components
+        new_fields = self.get_new_fields(inputs)
+
+        # Add fields from data entry vertices
+        for vertex, field_names in data_entry_vertices:
+            data_fields = self._get_data_fields_from_vertex(vertex, field_names, vdisp_cts)
+            new_fields.extend(data_fields)
+
+        return new_fields
 
     def update_build_config_from_graph(self, build_config: dotdict, graph: Graph):
         try:

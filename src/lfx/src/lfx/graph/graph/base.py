@@ -710,7 +710,7 @@ class Graph:
                     self._is_state_vertices = []
                 self._is_state_vertices.append(vertex.id)
 
-    def _set_inputs(self, input_components: list[str], inputs: dict[str, str], input_type: InputType | None) -> None:
+    def _set_inputs(self, input_components: list[str], inputs: dict[str, Any], input_type: InputType | None) -> None:
         """Updates input vertices' parameters with the provided inputs, filtering by component list and input type.
 
         Only vertices whose IDs or display names match the specified input components and whose IDs contain
@@ -735,7 +735,7 @@ class Graph:
     async def _run(
         self,
         *,
-        inputs: dict[str, str],
+        inputs: dict[str, Any],
         input_components: list[str],
         input_type: InputType | None,
         outputs: list[str],
@@ -747,7 +747,8 @@ class Graph:
         """Runs the graph with the given inputs.
 
         Args:
-            inputs (Dict[str, str]): The input values for the graph.
+            inputs (Dict[str, Any]): The input values for the graph. Values can be strings,
+                Data objects, DataFrame objects, or other Langflow data types.
             input_components (list[str]): The components to run for the inputs.
             input_type: (Optional[InputType]): The input type.
             outputs (list[str]): The outputs to retrieve from the graph.
@@ -765,9 +766,7 @@ class Graph:
         if input_components is None:
             input_components = []
 
-        if not isinstance(inputs.get(INPUT_FIELD_NAME, ""), str):
-            msg = f"Invalid input value: {inputs.get(INPUT_FIELD_NAME)}. Expected string"
-            raise TypeError(msg)
+        # Accept any input value type (str, Data, DataFrame, dict, etc.)
         if inputs:
             self._set_inputs(input_components, inputs, input_type)
         # Update all the vertices with the session_id
