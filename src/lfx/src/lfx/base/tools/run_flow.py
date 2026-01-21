@@ -187,6 +187,8 @@ class RunFlowBaseComponent(Component):
     def update_build_config_from_graph(self, build_config: dotdict, graph: Graph):
         try:
             new_fields = self.get_new_fields_from_graph(graph)
+            # Ensure all fields can accept Message type connections
+            new_fields = self.update_input_types(new_fields)
             keep_fields: set[str] = set(
                 [new_field["name"] for new_field in new_fields] + self.default_keys
             )
@@ -749,6 +751,9 @@ class RunFlowBaseComponent(Component):
         if value is None:
             return ""
         if isinstance(value, str):
+            return value
+        # Preserve lists as-is (e.g., files field should remain a list, not be stringified)
+        if isinstance(value, list):
             return value
         # Handle Message, Data, or dict-like objects
         if isinstance(value, dict):
