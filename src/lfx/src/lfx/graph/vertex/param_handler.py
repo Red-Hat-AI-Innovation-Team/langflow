@@ -118,6 +118,12 @@ class ParameterHandler:
                 params, load_from_db_fields = self._process_direct_type_field(
                     field_name, field, params, load_from_db_fields
                 )
+            elif field.get("type") == "other":
+                # Handle "other" type fields (e.g., DataFrame, Data) that have a value set
+                # These typically come from tweaks/RunFlow and should be passed through as-is
+                value = field.get("value")
+                if value is not None:
+                    params[field_name] = value
             else:
                 msg = f"Field {field_name} in {self.vertex.display_name} is not a valid field type: {field.get('type')}"
                 raise ValueError(msg)
@@ -130,9 +136,17 @@ class ParameterHandler:
         """Determine if field should be skipped."""
         if field.get("override_skip"):
             return False
+        # Don't skip "other" type fields if they have a value set
+        # (e.g., DataFrame/Data fields that receive values via tweaks from RunFlow)
+        if field.get("type") == "other":
+            value = field.get("value")
+            # If the field has a non-None value, don't skip it
+            if value is not None:
+                return False
+            # Otherwise, skip "other" type fields (they typically come from edges)
+            return True
         return (
-            field.get("type") == "other"
-            or field_name in params
+            field_name in params
             or field_name == "_type"
             or (not field.get("show") and field_name != "code")
         )

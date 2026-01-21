@@ -4,7 +4,7 @@ from types import MethodType  # near the imports
 from typing import TYPE_CHECKING, Any
 
 from langflow.helpers.flow import get_flow_by_id_or_name
-from langflow.processing.process import process_tweaks
+from langflow.processing.process import process_tweaks_on_graph
 
 from lfx.base.tools.constants import TOOL_OUTPUT_NAME
 from lfx.custom.custom_component.component import Component, get_component_toolkit
@@ -17,6 +17,7 @@ from lfx.helpers import get_flow_inputs, run_flow
 from lfx.inputs.inputs import BoolInput, DropdownInput, InputTypes, MessageTextInput, StrInput
 from lfx.log.logger import logger
 from lfx.schema.data import Data
+from lfx.schema.dataframe import DataFrame
 from lfx.schema.dotdict import dotdict
 from lfx.services.cache.utils import CacheMiss
 from lfx.services.deps import get_shared_component_cache_service
@@ -93,14 +94,7 @@ class RunFlowBaseComponent(Component):
         ),
     ]
     _base_outputs: list[Output] = []
-    default_keys = [
-        "code",
-        "_type",
-        "flow_name_selected",
-        "flow_id_selected",
-        "session_id",
-        "cache_flow",
-    ]
+    default_keys = ["code", "_type", "flow_name_selected", "flow_id_selected", "session_id", "cache_flow"]
     FLOW_INPUTS: list[dotdict] = []
     flow_tweak_data: dict = {}
     IOPUT_SEP = "~"  # separator for joining a vertex id and input/output name to form a unique input/output name
@@ -115,12 +109,7 @@ class RunFlowBaseComponent(Component):
     def _ensure_flow_output_methods(self) -> None:
         self._clear_dynamic_flow_output_methods()
         for output in self._outputs_map.values():
-            if (
-                not output
-                or not output.name
-                or output.name == TOOL_OUTPUT_NAME
-                or self.IOPUT_SEP not in output.name
-            ):
+            if not output or not output.name or output.name == TOOL_OUTPUT_NAME or self.IOPUT_SEP not in output.name:
                 continue
             vertex_id, output_name = output.name.split(self.IOPUT_SEP, 1)
             output.method = self._register_flow_output_method(
@@ -131,9 +120,7 @@ class RunFlowBaseComponent(Component):
     ################################################################
     # Flow retrieval
     ################################################################
-    async def get_flow(
-        self, flow_name_selected: str | None = None, flow_id_selected: str | None = None
-    ) -> Data:
+    async def get_flow(self, flow_name_selected: str | None = None, flow_id_selected: str | None = None) -> Data:
         """Get a flow's data by name or id."""
         flow = await get_flow_by_id_or_name(
             user_id=self.user_id,
@@ -158,9 +145,7 @@ class RunFlowBaseComponent(Component):
             self._flow_cache_call("delete", flow_id=flow_id_selected)  # stale, delete it
 
         # TODO: use flow id only
-        flow = await self.get_flow(
-            flow_name_selected=flow_name_selected, flow_id_selected=flow_id_selected
-        )
+        flow = await self.get_flow(flow_name_selected=flow_name_selected, flow_id_selected=flow_id_selected)
         if not flow:
             msg = "Flow not found"
             raise ValueError(msg)
@@ -180,21 +165,129 @@ class RunFlowBaseComponent(Component):
     ################################################################
     # Flow inputs/config
     ################################################################
+    def _get_data_entry_vertices(self, graph: Graph) -> list[tuple[Vertex, list[str]]]:
+        """Find vertices with unconnected required DataFrame/Data inputs.
+
+        Scans all vertices in the graph for inputs that:
+        - Have input_types containing "DataFrame" or "Data"
+        - Are marked as required=True
+        - Are NOT connected (no incoming edge to that input)
+
+        Args:
+            graph: The graph to scan for data entry points.
+
+        Returns:
+            List of tuples (vertex, [field_names]) for vertices with unconnected data inputs.
+        """
+        data_entry_vertices: list[tuple[Vertex, list[str]]] = []
+        data_input_types = {"DataFrame", "Data"}
+
+        # Build a set of connected inputs: (target_vertex_id, field_name)
+        connected_inputs: set[tuple[str, str]] = set()
+        for edge in graph.edges:
+            target_id = edge.target_id
+            field_name = edge.target_handle.field_name if hasattr(edge, "target_handle") else None
+            if field_name:
+                connected_inputs.add((target_id, field_name))
+
+        for vertex in graph.vertices:
+            if vertex.is_input:
+                continue
+
+            field_template = vertex.data.get("node", {}).get("template", {})
+            unconnected_data_fields: list[str] = []
+
+            for field_name, field_config in field_template.items():
+                if not isinstance(field_config, dict):
+                    continue
+
+                input_types = field_config.get("input_types", [])
+                has_data_type = any(t in data_input_types for t in input_types)
+                if not has_data_type:
+                    continue
+
+                is_required = field_config.get("required", False)
+                if not is_required:
+                    continue
+
+                is_connected = (vertex.id, field_name) in connected_inputs
+                if is_connected:
+                    continue
+
+                unconnected_data_fields.append(field_name)
+
+            if unconnected_data_fields:
+                data_entry_vertices.append((vertex, unconnected_data_fields))
+
+        return data_entry_vertices
+
+    def _get_data_fields_from_vertex(
+        self, vertex: Vertex, field_names: list[str], vdisp_cts: dict[str, int]
+    ) -> list[dotdict]:
+        """Extract only specific fields from a vertex for data entry points."""
+        from typing import Any
+
+        field_template = vertex.data.get("node", {}).get("template", {})
+        fields: list[dotdict] = []
+
+        for field_name in field_names:
+            if field_name not in field_template:
+                continue
+
+            field_config = dict(field_template[field_name])
+            if not isinstance(field_config, dict):
+                continue
+
+            # Map "other" type to Any for Pydantic schema compatibility
+            # "other" type fields are complex objects (DataFrame, Data, etc.)
+            if field_config.get("type") == "other":
+                field_config["type"] = Any
+
+            display_name = field_config.get("display_name", field_name)
+            if vdisp_cts.get(vertex.display_name, 1) == 1:
+                full_display_name = f"{display_name} ({vertex.display_name})"
+            else:
+                full_display_name = f"{display_name} ({vertex.display_name}-{vertex.id.split('-')[-1]})"
+
+            fields.append(
+                dotdict(
+                    {
+                        **field_config,
+                        "name": self._get_ioput_name(vertex.id, field_name),
+                        "display_name": full_display_name,
+                        "tool_mode": not field_config.get("advanced", False),
+                    }
+                )
+            )
+
+        return fields
+
     def get_new_fields_from_graph(self, graph: Graph) -> list[dotdict]:
+        # Get standard input components (ChatInput, TextInput, etc.)
         inputs = get_flow_inputs(graph)
-        return self.get_new_fields(inputs)
+
+        # Also get data entry points (components with unconnected required DataFrame/Data inputs)
+        data_entry_vertices = self._get_data_entry_vertices(graph)
+
+        # Build display name counter for all vertices
+        all_vertices = list(inputs) + [v for v, _ in data_entry_vertices]
+        vdisp_cts = Counter(v.display_name for v in all_vertices)
+
+        # Get fields from standard input components
+        new_fields = self.get_new_fields(inputs)
+
+        # Add fields from data entry vertices
+        for vertex, field_names in data_entry_vertices:
+            data_fields = self._get_data_fields_from_vertex(vertex, field_names, vdisp_cts)
+            new_fields.extend(data_fields)
+
+        return new_fields
 
     def update_build_config_from_graph(self, build_config: dotdict, graph: Graph):
         try:
             new_fields = self.get_new_fields_from_graph(graph)
-            # Ensure all fields can accept Message type connections
-            new_fields = self.update_input_types(new_fields)
-            keep_fields: set[str] = set(
-                [new_field["name"] for new_field in new_fields] + self.default_keys
-            )
-            self.delete_fields(
-                build_config, [key for key in build_config if key not in keep_fields]
-            )
+            keep_fields: set[str] = set([new_field["name"] for new_field in new_fields] + self.default_keys)
+            self.delete_fields(build_config, [key for key in build_config if key not in keep_fields])
             build_config.update((field["name"], field) for field in new_fields)
         except Exception as e:
             msg = "Error updating build config from graph"
@@ -267,25 +360,18 @@ class RunFlowBaseComponent(Component):
                 - tool_mode_fields (list[dotdict]): Input fields marked for tool mode
             Returns None if the flow cannot be found or loaded.
         """
-        graph = await self.get_graph(
-            self.flow_name_selected, self.flow_id_selected, self._cached_flow_updated_at
-        )
+        graph = await self.get_graph(self.flow_name_selected, self.flow_id_selected, self._cached_flow_updated_at)
         formatted_outputs = self._format_flow_outputs(graph)
         self._sync_flow_outputs(formatted_outputs)
         new_fields = self.get_new_fields_from_graph(graph)
         new_fields = self.update_input_types(new_fields)
 
-        return (
-            graph.description,
-            [field for field in new_fields if field.get("tool_mode") is True],
-        )
+        return (graph.description, [field for field in new_fields if field.get("tool_mode") is True])
 
     def update_input_types(self, fields: list[dotdict]) -> list[dotdict]:
         """Update the input_types of the fields.
 
-            Ensures all fields can accept Message type connections, enabling
-            both TextInput and ChatInput components to be wired to Run Flow
-            input terminals.
+            If a field's input_types is None, it will be set to an empty list.
 
         Args:
             fields: The fields to update the input_types for.
@@ -295,17 +381,10 @@ class RunFlowBaseComponent(Component):
         """
         for field in fields:
             if isinstance(field, dict):
-                input_types = field.get("input_types")
-                # Ensure Message type is accepted to allow ChatInput/TextInput connections
-                if input_types is None or len(input_types) == 0:
-                    field["input_types"] = ["Message"]
-                elif "Message" not in input_types:
-                    field["input_types"] = list(input_types) + ["Message"]
-            elif hasattr(field, "input_types"):
-                if field.input_types is None or len(field.input_types) == 0:
-                    field.input_types = ["Message"]
-                elif "Message" not in field.input_types:
-                    field.input_types = list(field.input_types) + ["Message"]
+                if field.get("input_types", None) is None:
+                    field["input_types"] = []
+            elif hasattr(field, "input_types") and field.input_types is None:
+                field.input_types = []
         return fields
 
     async def _get_tools(self) -> list[Tool]:
@@ -339,9 +418,7 @@ class RunFlowBaseComponent(Component):
         if self._last_run_outputs is not None:
             return self._last_run_outputs
         resolved_tweaks = tweaks or self.flow_tweak_data or {}
-        resolved_inputs = (
-            inputs or self._flow_run_inputs or self._build_inputs_from_tweaks(resolved_tweaks)
-        ) or None
+        resolved_inputs = (inputs or self._flow_run_inputs or self._build_inputs_from_tweaks(resolved_tweaks)) or None
         self._last_run_outputs = await self._run_flow_with_cached_graph(
             user_id=user_id,
             tweaks=resolved_tweaks,
@@ -450,18 +527,14 @@ class RunFlowBaseComponent(Component):
             return frontend_node
 
         flow_selected_metadata = (
-            frontend_node.get("template", {})
-            .get("flow_name_selected", {})
-            .get("selected_metadata", {})
+            frontend_node.get("template", {}).get("flow_name_selected", {}).get("selected_metadata", {})
         )
         graph = await self.get_graph(
             flow_name_selected=field_value,
             flow_id_selected=flow_selected_metadata.get("id"),
             updated_at=flow_selected_metadata.get("updated_at"),
         )
-        outputs = self._format_flow_outputs(
-            graph
-        )  # generate Output objects from the flow's output nodes
+        outputs = self._format_flow_outputs(graph)  # generate Output objects from the flow's output nodes
         self._sync_flow_outputs(outputs)
         frontend_node["outputs"] = [output.model_dump() for output in outputs]
         return frontend_node
@@ -545,62 +618,16 @@ class RunFlowBaseComponent(Component):
         inputs: dict | list[dict] | None = None,
         output_type: str = "any",  # "any" is used to return all outputs
     ):
-        # When tweaks are provided, we must apply them to the FLOW DATA before
-        # creating the Graph. The old approach using process_tweaks_on_graph()
-        # doesn't work because apply_tweaks_on_vertex() only updates vertex.params
-        # if the key already exists there.
-        #
-        # The correct approach (matching simple_run_flow in endpoints.py) is:
-        # 1. Get the flow data
-        # 2. Apply tweaks using process_tweaks() which modifies the JSON template data
-        # 3. Create the Graph from the tweaked data
-        # 4. Run the graph with the provided inputs
-
+        graph = await self.get_graph(
+            flow_name_selected=self.flow_name_selected,
+            flow_id_selected=self.flow_id_selected,
+            updated_at=self._cached_flow_updated_at,
+        )
         if tweaks:
-            # Save original vertex IDs before process_tweaks modifies the dict
-            # (process_tweaks adds "stream" key to the dict in place)
-            original_vertex_ids = list(tweaks.keys())
+            graph = process_tweaks_on_graph(graph, tweaks)
 
-            # Get fresh flow data (don't use cache when tweaks are provided)
-            flow = await self.get_flow(
-                flow_name_selected=self.flow_name_selected,
-                flow_id_selected=self.flow_id_selected,
-            )
-            if not flow:
-                msg = "Flow not found"
-                raise ValueError(msg)
-
-            # Apply tweaks to the flow data BEFORE creating the Graph
-            flow_data = flow.data.get("data", {})
-            tweaked_flow_data = process_tweaks(flow_data, tweaks)
-
-            # Create Graph from the tweaked data
-            graph = Graph.from_payload(
-                payload=tweaked_flow_data,
-                flow_id=self.flow_id_selected,
-                flow_name=self.flow_name_selected,
-            )
-            graph.description = flow.data.get("description", None)
-            graph.updated_at = flow.data.get("updated_at", None)
-
-            logger.debug(
-                f"[RunFlow] Applied tweaks to {len(original_vertex_ids)} vertices "
-                f"in flow {self.flow_name_selected}"
-            )
-        else:
-            # No tweaks - use cached graph for performance
-            graph = await self.get_graph(
-                flow_name_selected=self.flow_name_selected,
-                flow_id_selected=self.flow_id_selected,
-                updated_at=self._cached_flow_updated_at,
-            )
-
-        # Run the graph with the provided inputs (which contain the same values as tweaks).
-        # We need to pass inputs so the graph.arun loop executes at least once.
-        run_inputs = inputs if inputs else []
-        logger.debug(f"[RunFlow] Running graph with {len(run_inputs)} inputs")
         return await run_flow(
-            inputs=run_inputs,
+            inputs=inputs,
             flow_id=self.flow_id_selected,
             flow_name=self.flow_name_selected,
             user_id=user_id,
@@ -629,11 +656,7 @@ class RunFlowBaseComponent(Component):
         try:
             return handler(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001
-            key = (
-                kwargs.get("cache_key")
-                or kwargs.get("flow_name")
-                or kwargs.get("flow_name_selected")
-            )
+            key = kwargs.get("cache_key") or kwargs.get("flow_name") or kwargs.get("flow_name_selected")
             if not key and args:
                 key = args[0]
             logger.warning("Cache %s failed for key %s: %s", action, key or "[missing key]", exc)
@@ -735,40 +758,6 @@ class RunFlowBaseComponent(Component):
     ################################################################
     # Build inputs and flow tweak data
     ################################################################
-    def _normalize_input_value(self, value: Any) -> str | Any:
-        """Normalize input value to string if it's a complex object.
-
-        When a prompt template or other component is wired to the input terminal,
-        it may pass a Message, Data, or dict object instead of a plain string.
-        This method extracts the text content from such objects.
-
-        Args:
-            value: The input value to normalize (may be str, dict, Message, Data, etc.)
-
-        Returns:
-            The extracted string value, or the original value if no text content found.
-        """
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        # Preserve lists as-is (e.g., files field should remain a list, not be stringified)
-        if isinstance(value, list):
-            return value
-        # Handle Message, Data, or dict-like objects
-        if isinstance(value, dict):
-            for key in ("text", "content", "message", "input_value"):
-                if key in value:
-                    return self._normalize_input_value(value[key])
-            return value  # Return as-is if no known text keys
-        # Handle objects with text/content attributes (Message, Data classes)
-        for attr in ("text", "content", "message"):
-            if hasattr(value, attr):
-                attr_value = getattr(value, attr)
-                if attr_value is not None:
-                    return self._normalize_input_value(attr_value)
-        return str(value)
-
     def _extract_tweaks_from_keyed_values(
         self,
         values: dict[str, Any] | None,
@@ -780,80 +769,8 @@ class RunFlowBaseComponent(Component):
             if self.IOPUT_SEP not in field_name:
                 continue
             node_id, param_name = field_name.split(self.IOPUT_SEP, 1)
-            # Normalize input values from text input/chat input/prompt templates
-            # to handle Message/Data objects that should be plain strings
-            normalized_value = self._normalize_input_value(field_value)
-            tweaks.setdefault(node_id, {})[param_name] = normalized_value
+            tweaks.setdefault(node_id, {})[param_name] = field_value
         return tweaks
-
-    def _infer_input_type(self, vertex_id: str) -> str:
-        """Infer the input type from the vertex ID.
-
-        Args:
-            vertex_id: The vertex ID (e.g., 'TextInput-4z0su', 'ChatInput-abc123')
-
-        Returns:
-            The inferred type: 'text' for TextInput, 'chat' for ChatInput, etc.
-        """
-        vertex_id_lower = vertex_id.lower()
-        if vertex_id_lower.startswith("textinput"):
-            return "text"
-        if vertex_id_lower.startswith("chatinput"):
-            return "chat"
-        if vertex_id_lower.startswith("messagetextinput"):
-            return "text"
-        # Default to text for unknown types (safer than chat)
-        return "text"
-
-    def _get_parent_input_value_by_type(self, input_type: str) -> str | None:
-        """Get the parent graph's input value for a matching input type.
-
-        When a sub-flow has a ChatInput/TextInput that doesn't have an explicit value
-        wired to it, this method attempts to find the parent graph's corresponding
-        input value to forward automatically.
-
-        Args:
-            input_type: The type of input to look for ('chat' or 'text')
-
-        Returns:
-            The parent's input value if found, None otherwise.
-        """
-        if not hasattr(self, "graph") or self.graph is None:
-            return None
-
-        # Get the parent graph's input vertices
-        parent_input_vertices = getattr(self.graph, "_is_input_vertices", [])
-        if not parent_input_vertices:
-            return None
-
-        for vertex_id in parent_input_vertices:
-            # Check if this vertex matches the requested input type
-            vertex_id_lower = vertex_id.lower()
-            if input_type == "chat" and "chatinput" not in vertex_id_lower:
-                continue
-            if input_type == "text" and "textinput" not in vertex_id_lower:
-                continue
-
-            vertex = self.graph.get_vertex(vertex_id)
-            if vertex is None:
-                continue
-
-            # Try to get the input_value from the vertex's raw params
-            raw_params = getattr(vertex, "_raw_params", {})
-            if raw_params and "input_value" in raw_params:
-                value = raw_params.get("input_value")
-                if value:
-                    return self._normalize_input_value(value)
-
-            # Try to get from vertex data
-            vertex_template = vertex.data.get("node", {}).get("template", {})
-            input_value_field = vertex_template.get("input_value", {})
-            if isinstance(input_value_field, dict):
-                value = input_value_field.get("value")
-                if value:
-                    return self._normalize_input_value(value)
-
-        return None
 
     def _build_inputs_from_tweaks(
         self,
@@ -863,33 +780,12 @@ class RunFlowBaseComponent(Component):
         for vertex_id, params in tweaks.items():
             if "input_value" not in params:
                 continue
-            # Normalize input value to handle Message/Data objects from prompt templates
-            # (defensive - values should already be normalized by _extract_tweaks_from_keyed_values)
-            normalized_value = self._normalize_input_value(params["input_value"])
-
-            # Infer input type from vertex ID if not explicitly provided
-            input_type = params.get("type") or self._infer_input_type(vertex_id)
-
-            # If the sub-flow input has an empty value, try to forward the parent's
-            # matching input (e.g., parent ChatInput -> sub-flow ChatInput)
-            if not normalized_value:
-                parent_value = self._get_parent_input_value_by_type(input_type)
-                if parent_value:
-                    normalized_value = parent_value
-                    display_value = (
-                        f"{normalized_value[:50]}..."
-                        if len(str(normalized_value)) > 50
-                        else normalized_value
-                    )
-                    self.log(
-                        f"[RunFlow] Auto-forwarding parent {input_type} input to {vertex_id}: {display_value}"
-                    )
-
             payload: dict[str, Any] = {
                 "components": [vertex_id],
-                "input_value": normalized_value,
-                "type": input_type,
+                "input_value": params["input_value"],
             }
+            if params.get("type"):
+                payload["type"] = params["type"]
             inputs.append(payload)
         return inputs
 
