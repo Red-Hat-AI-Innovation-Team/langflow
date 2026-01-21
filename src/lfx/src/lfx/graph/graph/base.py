@@ -36,7 +36,7 @@ from lfx.graph.vertex.schema import NodeData, NodeTypeEnum
 from lfx.graph.vertex.vertex_types import ComponentVertex, InterfaceVertex, StateVertex
 from lfx.log.logger import LogConfig, configure, logger
 from lfx.schema.dotdict import dotdict
-from lfx.schema.schema import INPUT_FIELD_NAME, InputType, OutputValue
+from lfx.schema.schema import InputType, OutputValue
 from lfx.services.cache.utils import CacheMiss
 from lfx.services.deps import get_chat_service, get_tracing_service
 from lfx.utils.async_helpers import run_until_complete
@@ -707,7 +707,7 @@ class Graph:
                     self._is_state_vertices = []
                 self._is_state_vertices.append(vertex.id)
 
-    def _set_inputs(self, input_components: list[str], inputs: dict[str, str], input_type: InputType | None) -> None:
+    def _set_inputs(self, input_components: list[str], inputs: dict[str, Any], input_type: InputType | None) -> None:
         """Updates input vertices' parameters with the provided inputs, filtering by component list and input type.
 
         Only vertices whose IDs or display names match the specified input components and whose IDs contain
@@ -731,7 +731,7 @@ class Graph:
     async def _run(
         self,
         *,
-        inputs: dict[str, str],
+        inputs: dict[str, Any],
         input_components: list[str],
         input_type: InputType | None,
         outputs: list[str],
@@ -743,7 +743,7 @@ class Graph:
         """Runs the graph with the given inputs.
 
         Args:
-            inputs (Dict[str, str]): The input values for the graph.
+            inputs (Dict[str, Any]): The input values for the graph.
             input_components (list[str]): The components to run for the inputs.
             input_type: (Optional[InputType]): The input type.
             outputs (list[str]): The outputs to retrieve from the graph.
@@ -761,9 +761,6 @@ class Graph:
         if input_components is None:
             input_components = []
 
-        if not isinstance(inputs.get(INPUT_FIELD_NAME, ""), str):
-            msg = f"Invalid input value: {inputs.get(INPUT_FIELD_NAME)}. Expected string"
-            raise TypeError(msg)
         if inputs:
             self._set_inputs(input_components, inputs, input_type)
         # Update all the vertices with the session_id
@@ -814,7 +811,7 @@ class Graph:
 
     async def arun(
         self,
-        inputs: list[dict[str, str]],
+        inputs: list[dict[str, Any]],
         *,
         inputs_components: list[list[str]] | None = None,
         types: list[InputType | None] | None = None,
@@ -827,7 +824,7 @@ class Graph:
         """Runs the graph with the given inputs.
 
         Args:
-            inputs (list[Dict[str, str]]): The input values for the graph.
+            inputs (list[Dict[str, Any]]): The input values for the graph.
             inputs_components (Optional[list[list[str]]], optional): Components to run for the inputs. Defaults to None.
             types (Optional[list[Optional[InputType]]], optional): The types of the inputs. Defaults to None.
             outputs (Optional[list[str]], optional): The outputs to retrieve from the graph. Defaults to None.

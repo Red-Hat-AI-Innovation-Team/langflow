@@ -350,7 +350,7 @@ class Vertex:
         self.load_from_db_fields = load_from_db_fields
         self.raw_params = self.params.copy()
 
-    def update_raw_params(self, new_params: Mapping[str, str | list[str]], *, overwrite: bool = False) -> None:
+    def update_raw_params(self, new_params: Mapping[str, Any], *, overwrite: bool = False) -> None:
         """Update the raw parameters of the vertex with the given new parameters.
 
         Args:

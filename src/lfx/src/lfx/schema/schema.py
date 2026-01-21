@@ -1,6 +1,6 @@
 from collections.abc import Generator
 from enum import Enum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pandas import Series
 from pydantic import BaseModel, ConfigDict, Field
@@ -142,7 +142,7 @@ class BuildStatus(BaseModel):
 
 class InputValueRequest(BaseModel):
     components: list[str] | None = []
-    input_value: str | None = None
+    input_value: Any = None
     session: str | None = None
     type: InputType | None = Field(
         "any",

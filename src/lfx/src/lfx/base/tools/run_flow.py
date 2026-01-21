@@ -17,6 +17,7 @@ from lfx.helpers import get_flow_inputs, run_flow
 from lfx.inputs.inputs import BoolInput, DropdownInput, InputTypes, MessageTextInput, StrInput
 from lfx.log.logger import logger
 from lfx.schema.data import Data
+from lfx.schema.dataframe import DataFrame
 from lfx.schema.dotdict import dotdict
 from lfx.services.cache.utils import CacheMiss
 from lfx.services.deps import get_shared_component_cache_service
@@ -180,9 +181,117 @@ class RunFlowBaseComponent(Component):
     ################################################################
     # Flow inputs/config
     ################################################################
+    def _get_data_entry_vertices(self, graph: Graph) -> list[tuple[Vertex, list[str]]]:
+        """Find vertices with DataFrame or Data inputs that are not connected.
+
+        Scans all vertices in the graph and identifies inputs that:
+        - Have input_types containing "DataFrame" or "Data"
+        - Are required (required=True)
+        - Are not already connected via an edge
+
+        Args:
+            graph: The graph to scan for data entry points.
+
+        Returns:
+            List of (vertex, [field_names]) tuples where each vertex has
+            unconnected Data/DataFrame inputs.
+        """
+        data_entry_vertices: list[tuple[Vertex, list[str]]] = []
+        data_types = {"DataFrame", "Data"}
+
+        for vertex in graph.vertices:
+            # Skip vertices that are already input components (handled separately)
+            if vertex.is_input:
+                continue
+
+            field_template = vertex.data.get("node", {}).get("template", {})
+            if not field_template:
+                continue
+
+            # Get connected input param names for this vertex
+            connected_params = {edge.target_param for edge in vertex.incoming_edges}
+
+            # Find unconnected Data/DataFrame inputs
+            data_fields: list[str] = []
+            for field_name, field_config in field_template.items():
+                if not isinstance(field_config, dict):
+                    continue
+
+                # Check if this field accepts DataFrame or Data types
+                input_types = field_config.get("input_types", [])
+                if not input_types or not any(dt in input_types for dt in data_types):
+                    continue
+
+                # Skip if already connected
+                if field_name in connected_params:
+                    continue
+
+                # Only include required fields or fields with show=True
+                is_required = field_config.get("required", False)
+                is_shown = field_config.get("show", True)
+                if is_required or is_shown:
+                    data_fields.append(field_name)
+
+            if data_fields:
+                data_entry_vertices.append((vertex, data_fields))
+
+        return data_entry_vertices
+
+    def _get_data_entry_fields(self, graph: Graph) -> list[dotdict]:
+        """Generate input fields for Data/DataFrame entry points in the graph.
+
+        Args:
+            graph: The graph to scan for data entry points.
+
+        Returns:
+            List of dotdict field definitions for Data/DataFrame inputs.
+        """
+        data_entries = self._get_data_entry_vertices(graph)
+        if not data_entries:
+            return []
+
+        new_fields: list[dotdict] = []
+        # Count display names for disambiguation
+        vdisp_cts = Counter(v.display_name for v, _ in data_entries)
+
+        for vertex, field_names in data_entries:
+            field_template = vertex.data.get("node", {}).get("template", {})
+
+            for field_name in field_names:
+                if field_name not in field_template:
+                    continue
+
+                field_config = field_template[field_name]
+                new_fields.append(
+                    dotdict(
+                        {
+                            **field_config,
+                            "name": self._get_ioput_name(vertex.id, field_name),
+                            "display_name": (
+                                f"{field_config.get('display_name', field_name)} ({vertex.display_name})"
+                                if vdisp_cts[vertex.display_name] == 1
+                                else (
+                                    f"{field_config.get('display_name', field_name)}"
+                                    f"({vertex.display_name}-{vertex.id.split('-')[-1]})"
+                                )
+                            ),
+                            "tool_mode": not field_config.get("advanced", False),
+                        }
+                    )
+                )
+
+        return new_fields
+
     def get_new_fields_from_graph(self, graph: Graph) -> list[dotdict]:
+        # Get standard input component fields (ChatInput, TextInput, etc.)
         inputs = get_flow_inputs(graph)
-        return self.get_new_fields(inputs)
+        standard_fields = self.get_new_fields(inputs)
+
+        # Get Data/DataFrame entry point fields
+        data_entry_fields = self._get_data_entry_fields(graph)
+
+        # Merge both sets of fields
+        return standard_fields + data_entry_fields
 
     def update_build_config_from_graph(self, build_config: dotdict, graph: Graph):
         try:
@@ -537,6 +646,50 @@ class RunFlowBaseComponent(Component):
     ################################################################
     # Flow execution
     ################################################################
+    def _is_json_serializable(self, value: Any) -> bool:
+        """Check if a value can be serialized to JSON.
+
+        Args:
+            value: The value to check.
+
+        Returns:
+            True if the value is JSON-serializable, False otherwise.
+        """
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return True
+        if isinstance(value, (list, tuple)):
+            return all(self._is_json_serializable(item) for item in value)
+        if isinstance(value, dict):
+            return all(
+                isinstance(k, str) and self._is_json_serializable(v)
+                for k, v in value.items()
+            )
+        # DataFrame, Data, and other complex objects are not JSON-serializable
+        return False
+
+    def _separate_tweaks(
+        self, tweaks: dict[str, dict[str, Any]]
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Separate tweaks into JSON-serializable and non-serializable groups.
+
+        Args:
+            tweaks: The tweaks dictionary {vertex_id: {param_name: value}}.
+
+        Returns:
+            Tuple of (serializable_tweaks, non_serializable_tweaks).
+        """
+        serializable: dict[str, dict[str, Any]] = {}
+        non_serializable: dict[str, dict[str, Any]] = {}
+
+        for vertex_id, params in tweaks.items():
+            for param_name, value in params.items():
+                if self._is_json_serializable(value):
+                    serializable.setdefault(vertex_id, {})[param_name] = value
+                else:
+                    non_serializable.setdefault(vertex_id, {})[param_name] = value
+
+        return serializable, non_serializable
+
     async def _run_flow_with_cached_graph(
         self,
         *,
@@ -552,14 +705,16 @@ class RunFlowBaseComponent(Component):
         #
         # The correct approach (matching simple_run_flow in endpoints.py) is:
         # 1. Get the flow data
-        # 2. Apply tweaks using process_tweaks() which modifies the JSON template data
+        # 2. Apply JSON-serializable tweaks using process_tweaks() which modifies the JSON template data
         # 3. Create the Graph from the tweaked data
-        # 4. Run the graph with the provided inputs
+        # 4. Apply non-serializable tweaks (DataFrame, Data) directly to vertex params
+        # 5. Run the graph with the provided inputs
+
+        non_serializable_tweaks: dict[str, dict[str, Any]] = {}
 
         if tweaks:
-            # Save original vertex IDs before process_tweaks modifies the dict
-            # (process_tweaks adds "stream" key to the dict in place)
-            original_vertex_ids = list(tweaks.keys())
+            # Separate serializable tweaks (strings, numbers) from non-serializable (DataFrame, Data)
+            serializable_tweaks, non_serializable_tweaks = self._separate_tweaks(tweaks)
 
             # Get fresh flow data (don't use cache when tweaks are provided)
             flow = await self.get_flow(
@@ -570,9 +725,12 @@ class RunFlowBaseComponent(Component):
                 msg = "Flow not found"
                 raise ValueError(msg)
 
-            # Apply tweaks to the flow data BEFORE creating the Graph
+            # Apply JSON-serializable tweaks to the flow data BEFORE creating the Graph
             flow_data = flow.data.get("data", {})
-            tweaked_flow_data = process_tweaks(flow_data, tweaks)
+            if serializable_tweaks:
+                tweaked_flow_data = process_tweaks(flow_data, serializable_tweaks)
+            else:
+                tweaked_flow_data = flow_data
 
             # Create Graph from the tweaked data
             graph = Graph.from_payload(
@@ -584,7 +742,8 @@ class RunFlowBaseComponent(Component):
             graph.updated_at = flow.data.get("updated_at", None)
 
             logger.debug(
-                f"[RunFlow] Applied tweaks to {len(original_vertex_ids)} vertices "
+                f"[RunFlow] Applied {len(serializable_tweaks)} serializable tweaks, "
+                f"{len(non_serializable_tweaks)} non-serializable tweaks "
                 f"in flow {self.flow_name_selected}"
             )
         else:
@@ -594,6 +753,30 @@ class RunFlowBaseComponent(Component):
                 flow_id_selected=self.flow_id_selected,
                 updated_at=self._cached_flow_updated_at,
             )
+
+        # Apply non-serializable tweaks (DataFrame, Data objects) directly to vertex params
+        # This must happen AFTER graph creation since we need access to the vertex objects
+        if non_serializable_tweaks:
+            graph_vertex_ids = [v.id for v in graph.vertices]
+            logger.info(f"[RunFlow] Graph vertex IDs: {graph_vertex_ids}")
+            logger.info(f"[RunFlow] Non-serializable tweak vertex IDs: {list(non_serializable_tweaks.keys())}")
+            for vertex_id, params in non_serializable_tweaks.items():
+                vertex = graph.get_vertex(vertex_id)
+                if vertex is not None:
+                    logger.info(
+                        f"[RunFlow] Applying non-serializable params to vertex {vertex_id}: "
+                        f"{list(params.keys())} (current params keys: {list(vertex.params.keys())})"
+                    )
+                    vertex.update_raw_params(params, overwrite=True)
+                    logger.info(
+                        f"[RunFlow] After update, vertex {vertex_id} params keys: {list(vertex.params.keys())}, "
+                        f"df value type: {type(vertex.params.get('df', 'NOT_FOUND'))}"
+                    )
+                else:
+                    logger.warning(
+                        f"[RunFlow] Vertex {vertex_id} not found in graph! "
+                        f"Cannot apply non-serializable params: {list(params.keys())}"
+                    )
 
         # Run the graph with the provided inputs (which contain the same values as tweaks).
         # We need to pass inputs so the graph.arun loop executes at least once.
@@ -735,18 +918,19 @@ class RunFlowBaseComponent(Component):
     ################################################################
     # Build inputs and flow tweak data
     ################################################################
-    def _normalize_input_value(self, value: Any) -> str | Any:
-        """Normalize input value to string if it's a complex object.
+    def _normalize_input_value(self, value: Any) -> Any:
+        """Normalize input value, preserving Data/DataFrame types.
 
-        When a prompt template or other component is wired to the input terminal,
-        it may pass a Message, Data, or dict object instead of a plain string.
-        This method extracts the text content from such objects.
+        - Data/DataFrame objects: preserved as-is for subflow passthrough
+        - Message objects: extract text for text/chat inputs
+        - dict with text keys: extract text value
+        - Other objects: convert to string
 
         Args:
-            value: The input value to normalize (may be str, dict, Message, Data, etc.)
+            value: The input value to normalize (may be str, dict, Message, Data, DataFrame, etc.)
 
         Returns:
-            The extracted string value, or the original value if no text content found.
+            The normalized value - Data/DataFrame preserved, Message text extracted, others stringified.
         """
         if value is None:
             return ""
@@ -755,13 +939,21 @@ class RunFlowBaseComponent(Component):
         # Preserve lists as-is (e.g., files field should remain a list, not be stringified)
         if isinstance(value, list):
             return value
-        # Handle Message, Data, or dict-like objects
+        # Preserve DataFrame objects - pass through intact
+        if isinstance(value, DataFrame):
+            return value
+        # Handle Data-like objects (including Message which extends Data)
+        # Preserve all Data/Message objects as-is for subflow passthrough
+        # The target component will handle type conversion if needed
+        if isinstance(value, Data):
+            return value
+        # Handle dict-like objects
         if isinstance(value, dict):
             for key in ("text", "content", "message", "input_value"):
                 if key in value:
                     return self._normalize_input_value(value[key])
             return value  # Return as-is if no known text keys
-        # Handle objects with text/content attributes (Message, Data classes)
+        # Handle objects with text/content attributes (other Message-like classes)
         for attr in ("text", "content", "message"):
             if hasattr(value, attr):
                 attr_value = getattr(value, attr)
@@ -913,5 +1105,12 @@ class RunFlowBaseComponent(Component):
         if self._cached_flow_updated_at:
             self._attributes["flow_name_selected_updated_at"] = self._cached_flow_updated_at
         self._attributes["flow_tweak_data"] = {}
+
+        # Log attributes that contain the IOPUT_SEP (these are subflow inputs)
+        subflow_attrs = {k: type(v).__name__ for k, v in self._attributes.items() if self.IOPUT_SEP in k}
+        logger.info(f"[RunFlow] _pre_run_setup: Subflow input attributes: {subflow_attrs}")
+
         self.flow_tweak_data = self._extract_tweaks_from_keyed_values(self._attributes)
+        logger.info(f"[RunFlow] _pre_run_setup: Extracted tweaks: {[(k, {pk: type(pv).__name__ for pk, pv in v.items()}) for k, v in self.flow_tweak_data.items()]}")
+
         self._flow_run_inputs = self._build_inputs_from_tweaks(self.flow_tweak_data)

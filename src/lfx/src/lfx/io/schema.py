@@ -41,6 +41,32 @@ _convert_type_to_field_type = {
     list: MessageTextInput,
 }
 
+# Map string type names (from serialized field templates) to Python types
+# Used when creating Pydantic schemas from field definitions
+_string_type_to_python_type: dict[str, type] = {
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "dict": dict,
+    "NestedDict": dict,
+    "table": dict,
+    "file": str,
+    "prompt": str,
+    "code": str,
+    "other": Any,  # HandleInput types like DataFrameInput, DataInput
+    "tab": str,
+    "query": str,
+    "connect": Any,
+    "auth": dict,
+    "sortableList": list,
+    "tools": list,
+    "mcp": dict,
+    "model": Any,
+    "link": str,
+    "slider": float,
+}
+
 
 def flatten_schema(root_schema: dict[str, Any]) -> dict[str, Any]:
     """Flatten a JSON RPC style schema into a single level JSON Schema.
@@ -255,6 +281,9 @@ def create_input_schema_from_dict(inputs: list[dotdict], param_key: str | None =
     for input_model in inputs:
         # Create a Pydantic Field for each input field
         field_type = input_model.type
+        # Convert string type names to Python types for Pydantic schema creation
+        if isinstance(field_type, str):
+            field_type = _string_type_to_python_type.get(field_type, Any)
         if hasattr(input_model, "options") and isinstance(input_model.options, list) and input_model.options:
             literal_string = f"Literal{input_model.options}"
             # validate that the literal_string is a valid literal
