@@ -335,6 +335,76 @@ def _parse_json_in_mcp_result(result: Any) -> Any:
     return result
 
 
+def _parse_json_string_args(provided_args: dict[str, Any], arg_schema: type[BaseModel]) -> dict[str, Any]:
+    """Parse JSON strings in tool arguments for array/object fields.
+
+    When an LLM agent passes array or object data as JSON strings (e.g., from
+    previous tool outputs), this function parses them into proper Python objects.
+
+    Args:
+        provided_args: The arguments provided to the tool
+        arg_schema: The Pydantic model defining expected argument types
+
+    Returns:
+        Arguments with JSON strings parsed where appropriate
+    """
+    from typing import get_args, get_origin
+
+    parsed_args = {}
+    for key, value in provided_args.items():
+        if key not in arg_schema.model_fields:
+            parsed_args[key] = value
+            continue
+
+        field_info = arg_schema.model_fields[key]
+        field_type = field_info.annotation
+
+        # Check if field expects a list or dict and value is a string
+        if isinstance(value, str) and value.strip():
+            # Get the origin type (list, dict, etc.) for generic types
+            origin = get_origin(field_type)
+
+            # Handle Optional types (Union with None)
+            if origin is type(None):
+                parsed_args[key] = value
+                continue
+
+            # Check if it's a list type or dict type
+            expects_list = origin is list or field_type is list
+            expects_dict = origin is dict or field_type is dict
+
+            # Also check for Optional[list] or Optional[dict]
+            if not expects_list and not expects_dict:
+                type_args = get_args(field_type)
+                for arg in type_args:
+                    if arg is type(None):
+                        continue
+                    arg_origin = get_origin(arg)
+                    if arg_origin is list or arg is list:
+                        expects_list = True
+                        break
+                    if arg_origin is dict or arg is dict:
+                        expects_dict = True
+                        break
+
+            if expects_list or expects_dict:
+                try:
+                    parsed_value = json.loads(value)
+                    # Verify the parsed type matches expectation
+                    if expects_list and isinstance(parsed_value, list):
+                        parsed_args[key] = parsed_value
+                        continue
+                    if expects_dict and isinstance(parsed_value, dict):
+                        parsed_args[key] = parsed_value
+                        continue
+                except json.JSONDecodeError:
+                    pass  # Keep original string value
+
+        parsed_args[key] = value
+
+    return parsed_args
+
+
 def create_tool_coroutine(tool_name: str, arg_schema: type[BaseModel], client) -> Callable[..., Awaitable]:
     async def tool_coroutine(*args, **kwargs):
         # Get field names from the model (preserving order)
@@ -349,6 +419,8 @@ def create_tool_coroutine(tool_name: str, arg_schema: type[BaseModel], client) -
         # Merge in keyword arguments
         provided_args.update(kwargs)
         provided_args = _convert_camel_case_to_snake_case(provided_args, arg_schema)
+        # Parse JSON strings for array/object fields (from LLM agent outputs)
+        provided_args = _parse_json_string_args(provided_args, arg_schema)
         # Validate input and fill defaults for missing optional fields
         try:
             validated = arg_schema.model_validate(provided_args)
@@ -379,6 +451,8 @@ def create_tool_func(tool_name: str, arg_schema: type[BaseModel], client) -> Cal
             provided_args[field_names[i]] = arg
         provided_args.update(kwargs)
         provided_args = _convert_camel_case_to_snake_case(provided_args, arg_schema)
+        # Parse JSON strings for array/object fields (from LLM agent outputs)
+        provided_args = _parse_json_string_args(provided_args, arg_schema)
         try:
             validated = arg_schema.model_validate(provided_args)
         except Exception as e:  # noqa: BLE001
