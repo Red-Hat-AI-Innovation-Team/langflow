@@ -428,7 +428,10 @@ def create_tool_coroutine(tool_name: str, arg_schema: type[BaseModel], client) -
             _handle_tool_validation_error(e, tool_name, provided_args, arg_schema)
 
         try:
-            result = await client.run_tool(tool_name, arguments=validated.model_dump())
+            # Use exclude_unset=True to only include fields that were explicitly provided
+            # This prevents Pydantic from adding extra None fields for optional properties
+            # which can confuse MCP servers that don't expect them
+            result = await client.run_tool(tool_name, arguments=validated.model_dump(exclude_unset=True))
             # Auto-parse JSON in text content for agent consumption
             return _parse_json_in_mcp_result(result)
         except Exception as e:
@@ -459,7 +462,10 @@ def create_tool_func(tool_name: str, arg_schema: type[BaseModel], client) -> Cal
             _handle_tool_validation_error(e, tool_name, provided_args, arg_schema)
 
         try:
-            result = run_until_complete(client.run_tool(tool_name, arguments=validated.model_dump()))
+            # Use exclude_unset=True to only include fields that were explicitly provided
+            # This prevents Pydantic from adding extra None fields for optional properties
+            # which can confuse MCP servers that don't expect them
+            result = run_until_complete(client.run_tool(tool_name, arguments=validated.model_dump(exclude_unset=True)))
             # Auto-parse JSON in text content for agent consumption
             return _parse_json_in_mcp_result(result)
         except Exception as e:
