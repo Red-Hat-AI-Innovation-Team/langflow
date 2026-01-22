@@ -71,15 +71,44 @@ def flatten_schema(root_schema: dict[str, Any]) -> dict[str, Any]:
 
         # ── objects ─────────────────────────────────────────────────────────
         if t == "object":
+            props = schema.get("properties", {})
+
+            # If object has no explicit properties (dynamic object), treat as leaf node
+            if not props:
+                leaf: dict[str, Any] = {
+                    "type": "object",
+                    "description": schema.get("description", ""),
+                }
+                flat_props[name] = leaf
+                if inherited_req:
+                    required_list.append(name)
+                return
+
             req_here = set(schema.get("required", []))
-            for k, subschema in schema.get("properties", {}).items():
+            for k, subschema in props.items():
                 child_name = f"{name}.{k}" if name else k
                 _walk(name=child_name, schema=subschema, inherited_req=inherited_req and k in req_here)
             return
 
-        # ── arrays (always recurse into the first item as "[0]") ───────────
+        # ── arrays ───────────────────────────────────────────────────────
         if t == "array":
             items = schema.get("items", {})
+            items = _resolve_if_ref(items)
+
+            # If array items are objects with no explicit properties (e.g., additionalProperties: true),
+            # preserve the array as a leaf node rather than recursing into empty properties
+            items_type = items.get("type")
+            items_has_props = bool(items.get("properties"))
+            if items_type == "object" and not items_has_props:
+                leaf: dict[str, Any] = {
+                    "type": "array",
+                    "description": schema.get("description", ""),
+                }
+                flat_props[name] = leaf
+                if inherited_req:
+                    required_list.append(name)
+                return
+
             _walk(name=f"{name}[0]", schema=items, inherited_req=inherited_req)
             return
 
