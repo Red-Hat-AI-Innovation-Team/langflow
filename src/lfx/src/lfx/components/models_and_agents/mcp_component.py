@@ -149,6 +149,7 @@ class MCPToolsComponent(ComponentWithCache):
         "tool",
         "use_cache",
         "verify_ssl",
+        "use_fresh_connections",
         "enable_oauth",
         "oauth_url",
     ]
@@ -184,6 +185,16 @@ class MCPToolsComponent(ComponentWithCache):
                 "Disable only for development/testing with self-signed certificates."
             ),
             value=True,
+            advanced=True,
+        ),
+        BoolInput(
+            name="use_fresh_connections",
+            display_name="Use Fresh Connections",
+            info=(
+                "Create a fresh connection for each tool call instead of reusing sessions. "
+                "Enable this for servers like Dataverse that don't support persistent sessions."
+            ),
+            value=False,
             advanced=True,
         ),
         BoolInput(
@@ -338,6 +349,10 @@ class MCPToolsComponent(ComponentWithCache):
             if "verify_ssl" not in server_config:
                 verify_ssl = getattr(self, "verify_ssl", True)
                 server_config["verify_ssl"] = verify_ssl
+
+            # Add use_fresh_connections option to server config
+            use_fresh_connections = getattr(self, "use_fresh_connections", False)
+            server_config["use_fresh_connections"] = use_fresh_connections
 
             # Inject OAuth Authorization header if enabled (HTTP mode only)
             enable_oauth = getattr(self, "enable_oauth", False)

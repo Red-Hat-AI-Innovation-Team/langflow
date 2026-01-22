@@ -1464,6 +1464,75 @@ class MCPStreamableHttpClient:
         )
         return self.session
 
+    async def _run_tool_fresh_connection(
+        self, tool_name: str, arguments: dict[str, Any], timeout_seconds: float = 120.0
+    ) -> Any:
+        """Run a tool using a fresh connection (no session reuse).
+
+        This mode creates a new SSE/HTTP connection for each tool call,
+        which is required for servers like Dataverse that don't support
+        persistent sessions.
+
+        Args:
+            tool_name: Name of the tool to run
+            arguments: Dictionary of arguments to pass to the tool
+            timeout_seconds: Maximum time to wait for tool execution
+
+        Returns:
+            The result of the tool execution
+
+        Raises:
+            ValueError: If tool execution fails after retries
+        """
+        from mcp.client.streamable_http import streamablehttp_client
+
+        url = self._connection_params["url"]
+        headers = self._connection_params.get("headers", {})
+        verify_ssl = self._connection_params.get("verify_ssl", True)
+        connection_timeout = self._connection_params.get("timeout_seconds", 30)
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    await asyncio.sleep(2)
+
+                http_client = httpx.AsyncClient(
+                    headers=headers,
+                    verify=verify_ssl,
+                    timeout=httpx.Timeout(connection_timeout),
+                    follow_redirects=True,
+                )
+                try:
+                    async with streamablehttp_client(
+                        url=url,
+                        timeout=connection_timeout,
+                        headers=headers,
+                        httpx_client_factory=lambda *a, **kw: http_client,
+                    ) as (read, write, _):
+                        async with ClientSession(read, write) as session:
+                            await asyncio.wait_for(session.initialize(), timeout=30.0)
+                            result = await asyncio.wait_for(
+                                session.call_tool(tool_name, arguments=arguments),
+                                timeout=timeout_seconds,
+                            )
+                            return result
+                finally:
+                    await http_client.aclose()
+            except Exception as e:
+                error_str = str(e).lower()
+                is_retryable = any(x in error_str for x in ["504", "gateway", "connection", "timeout"])
+                if is_retryable and attempt < max_retries - 1:
+                    await logger.awarning(
+                        f"Fresh connection attempt {attempt + 1} failed for tool '{tool_name}': {e}, retrying..."
+                    )
+                    continue
+                raise ValueError(f"Failed to run tool '{tool_name}': {e}") from e
+
+        # This should not be reached, but just in case
+        msg = f"Failed to run tool '{tool_name}' after {max_retries} attempts"
+        raise ValueError(msg)
+
     async def _terminate_remote_session(self) -> None:
         """Attempt to explicitly terminate the remote MCP session via HTTP DELETE (best-effort)."""
         # Only relevant for Streamable HTTP or SSE transport
@@ -1502,6 +1571,11 @@ class MCPStreamableHttpClient:
         Raises:
             ValueError: If session is not initialized or tool execution fails
         """
+        # Check if fresh connections mode is enabled
+        if getattr(self, "_use_fresh_connections", False):
+            await logger.adebug(f"Using fresh connection mode for tool '{tool_name}'")
+            return await self._run_tool_fresh_connection(tool_name, arguments, timeout_seconds=120.0)
+
         if not self._connected or not self._connection_params:
             msg = "Session not initialized or disconnected. Call connect_to_server first."
             raise ValueError(msg)
@@ -1676,6 +1750,10 @@ async def update_tools(
         verify_ssl = server_config.get("verify_ssl", True)
         tools = await mcp_streamable_http_client.connect_to_server(url, headers=headers, verify_ssl=verify_ssl)
         client = mcp_streamable_http_client
+        # Enable fresh connections mode if configured
+        if server_config.get("use_fresh_connections", False):
+            client._use_fresh_connections = True
+            await logger.ainfo(f"Fresh connections mode enabled for server '{server_name}'")
     else:
         logger.error(f"Invalid MCP server mode for '{server_name}': {mode}")
         return "", [], {}
