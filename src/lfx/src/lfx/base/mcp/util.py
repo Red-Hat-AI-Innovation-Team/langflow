@@ -304,6 +304,37 @@ def _handle_tool_validation_error(
     raise ValueError(msg) from e
 
 
+def _parse_json_in_mcp_result(result: Any) -> Any:
+    """Parse JSON in text content of MCP CallToolResult for agent consumption.
+
+    This function checks if the result contains TextContent with JSON data
+    and adds a parsed_data attribute with the parsed JSON for easier consumption
+    by LLM agents.
+
+    Args:
+        result: The raw MCP CallToolResult
+
+    Returns:
+        The result with parsed_data attribute added if JSON was found
+    """
+    if not hasattr(result, "content") or not result.content:
+        return result
+
+    for item in result.content:
+        if hasattr(item, "type") and item.type == "text" and hasattr(item, "text"):
+            try:
+                parsed = json.loads(item.text)
+                # Add parsed_data attribute to the result for agent consumption
+                result.parsed_data = parsed
+                # Only parse the first text content that is valid JSON
+                break
+            except json.JSONDecodeError:
+                # Keep as-is if not valid JSON
+                pass
+
+    return result
+
+
 def create_tool_coroutine(tool_name: str, arg_schema: type[BaseModel], client) -> Callable[..., Awaitable]:
     async def tool_coroutine(*args, **kwargs):
         # Get field names from the model (preserving order)
@@ -325,7 +356,9 @@ def create_tool_coroutine(tool_name: str, arg_schema: type[BaseModel], client) -
             _handle_tool_validation_error(e, tool_name, provided_args, arg_schema)
 
         try:
-            return await client.run_tool(tool_name, arguments=validated.model_dump())
+            result = await client.run_tool(tool_name, arguments=validated.model_dump())
+            # Auto-parse JSON in text content for agent consumption
+            return _parse_json_in_mcp_result(result)
         except Exception as e:
             await logger.aerror(f"Tool '{tool_name}' execution failed: {e}")
             # Re-raise with more context
@@ -352,7 +385,9 @@ def create_tool_func(tool_name: str, arg_schema: type[BaseModel], client) -> Cal
             _handle_tool_validation_error(e, tool_name, provided_args, arg_schema)
 
         try:
-            return run_until_complete(client.run_tool(tool_name, arguments=validated.model_dump()))
+            result = run_until_complete(client.run_tool(tool_name, arguments=validated.model_dump()))
+            # Auto-parse JSON in text content for agent consumption
+            return _parse_json_in_mcp_result(result)
         except Exception as e:
             logger.error(f"Tool '{tool_name}' execution failed: {e}")
             # Re-raise with more context
