@@ -435,22 +435,17 @@ def _parse_json_string_args(provided_args: dict[str, Any], arg_schema: type[Base
 def _normalize_mcp_args(provided_args: dict[str, Any]) -> dict[str, Any]:
     """Normalize MCP tool arguments for compatibility.
 
-    Applies transformations to known parameters:
-    - data_product: Uppercased to match database naming conventions
+    Currently a pass-through function. Previously uppercased data_product
+    but this was reverted as the MCP server handles case normalization internally.
 
     Args:
         provided_args: The arguments provided to the tool
 
     Returns:
-        Arguments with normalizations applied
+        Arguments unchanged (reserved for future normalizations)
     """
-    normalized = provided_args.copy()
-
-    # Uppercase data_product to match database naming (e.g., "RoverPeople" -> "ROVERPEOPLE")
-    if "data_product" in normalized and isinstance(normalized["data_product"], str):
-        normalized["data_product"] = normalized["data_product"].upper()
-
-    return normalized
+    # Return as-is - MCP servers should handle their own case normalization
+    return provided_args
 
 
 def create_tool_coroutine(tool_name: str, arg_schema: type[BaseModel], client) -> Callable[..., Awaitable]:
@@ -481,7 +476,9 @@ def create_tool_coroutine(tool_name: str, arg_schema: type[BaseModel], client) -
             # Use exclude_unset=True to only include fields that were explicitly provided
             # This prevents Pydantic from adding extra None fields for optional properties
             # which can confuse MCP servers that don't expect them
-            result = await client.run_tool(tool_name, arguments=validated.model_dump(exclude_unset=True))
+            final_args = validated.model_dump(exclude_unset=True)
+            await logger.adebug(f"MCP tool '{tool_name}' call with arguments: {final_args}")
+            result = await client.run_tool(tool_name, arguments=final_args)
             # Auto-parse JSON in text content for agent consumption
             return _parse_json_in_mcp_result(result)
         except Exception as e:
