@@ -432,6 +432,27 @@ def _parse_json_string_args(provided_args: dict[str, Any], arg_schema: type[Base
     return parsed_args
 
 
+def _normalize_mcp_args(provided_args: dict[str, Any]) -> dict[str, Any]:
+    """Normalize MCP tool arguments for compatibility.
+
+    Applies transformations to known parameters:
+    - data_product: Uppercased to match database naming conventions
+
+    Args:
+        provided_args: The arguments provided to the tool
+
+    Returns:
+        Arguments with normalizations applied
+    """
+    normalized = provided_args.copy()
+
+    # Uppercase data_product to match database naming (e.g., "RoverPeople" -> "ROVERPEOPLE")
+    if "data_product" in normalized and isinstance(normalized["data_product"], str):
+        normalized["data_product"] = normalized["data_product"].upper()
+
+    return normalized
+
+
 def create_tool_coroutine(tool_name: str, arg_schema: type[BaseModel], client) -> Callable[..., Awaitable]:
     async def tool_coroutine(*args, **kwargs):
         # Get field names from the model (preserving order)
@@ -448,6 +469,8 @@ def create_tool_coroutine(tool_name: str, arg_schema: type[BaseModel], client) -
         provided_args = _convert_camel_case_to_snake_case(provided_args, arg_schema)
         # Parse JSON strings for array/object fields (from LLM agent outputs)
         provided_args = _parse_json_string_args(provided_args, arg_schema)
+        # Normalize known parameters for MCP compatibility
+        provided_args = _normalize_mcp_args(provided_args)
         # Validate input and fill defaults for missing optional fields
         try:
             validated = arg_schema.model_validate(provided_args)
@@ -483,6 +506,8 @@ def create_tool_func(tool_name: str, arg_schema: type[BaseModel], client) -> Cal
         provided_args = _convert_camel_case_to_snake_case(provided_args, arg_schema)
         # Parse JSON strings for array/object fields (from LLM agent outputs)
         provided_args = _parse_json_string_args(provided_args, arg_schema)
+        # Normalize known parameters for MCP compatibility
+        provided_args = _normalize_mcp_args(provided_args)
         try:
             validated = arg_schema.model_validate(provided_args)
         except Exception as e:  # noqa: BLE001
