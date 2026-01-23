@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from uuid import UUID
 
 import httpx
+import toon_format
 from anyio import ClosedResourceError
 from httpx import codes as httpx_codes
 from langchain_core.tools import StructuredTool
@@ -305,23 +306,24 @@ def _handle_tool_validation_error(
 
 
 def _parse_json_in_mcp_result(result: Any) -> Any:
-    """Parse JSON in text content of MCP CallToolResult for agent consumption.
+    """Parse JSON or TOON in text content of MCP CallToolResult for agent consumption.
 
-    This function checks if the result contains TextContent with JSON data
-    and adds a parsed_data attribute with the parsed JSON for easier consumption
-    by LLM agents.
+    This function checks if the result contains TextContent with JSON or TOON data
+    and adds a parsed_data attribute with the parsed data for easier consumption
+    by LLM agents. It tries JSON first, then falls back to TOON format.
 
     Args:
         result: The raw MCP CallToolResult
 
     Returns:
-        The result with parsed_data attribute added if JSON was found
+        The result with parsed_data attribute added if JSON or TOON was found
     """
     if not hasattr(result, "content") or not result.content:
         return result
 
     for item in result.content:
         if hasattr(item, "type") and item.type == "text" and hasattr(item, "text"):
+            # Try JSON first
             try:
                 parsed = json.loads(item.text)
                 # Add parsed_data attribute to the result for agent consumption
@@ -329,24 +331,35 @@ def _parse_json_in_mcp_result(result: Any) -> Any:
                 # Only parse the first text content that is valid JSON
                 break
             except json.JSONDecodeError:
-                # Keep as-is if not valid JSON
+                pass
+
+            # Try TOON format as fallback
+            try:
+                parsed = toon_format.decode(item.text)
+                # Add parsed_data attribute to the result for agent consumption
+                result.parsed_data = parsed
+                # Only parse the first text content that is valid TOON
+                break
+            except Exception:
+                # Keep as-is if neither JSON nor TOON
                 pass
 
     return result
 
 
 def _parse_json_string_args(provided_args: dict[str, Any], arg_schema: type[BaseModel]) -> dict[str, Any]:
-    """Parse JSON strings in tool arguments for array/object fields.
+    """Parse JSON or TOON strings in tool arguments for array/object fields.
 
-    When an LLM agent passes array or object data as JSON strings (e.g., from
+    When an LLM agent passes array or object data as JSON or TOON strings (e.g., from
     previous tool outputs), this function parses them into proper Python objects.
+    It tries JSON first, then falls back to TOON format.
 
     Args:
         provided_args: The arguments provided to the tool
         arg_schema: The Pydantic model defining expected argument types
 
     Returns:
-        Arguments with JSON strings parsed where appropriate
+        Arguments with JSON/TOON strings parsed where appropriate
     """
     from typing import get_args, get_origin
 
@@ -388,6 +401,7 @@ def _parse_json_string_args(provided_args: dict[str, Any], arg_schema: type[Base
                         break
 
             if expects_list or expects_dict:
+                # Try JSON first
                 try:
                     parsed_value = json.loads(value)
                     # Verify the parsed type matches expectation
@@ -398,6 +412,19 @@ def _parse_json_string_args(provided_args: dict[str, Any], arg_schema: type[Base
                         parsed_args[key] = parsed_value
                         continue
                 except json.JSONDecodeError:
+                    pass
+
+                # Try TOON format as fallback
+                try:
+                    parsed_value = toon_format.decode(value)
+                    # Verify the parsed type matches expectation
+                    if expects_list and isinstance(parsed_value, list):
+                        parsed_args[key] = parsed_value
+                        continue
+                    if expects_dict and isinstance(parsed_value, dict):
+                        parsed_args[key] = parsed_value
+                        continue
+                except Exception:
                     pass  # Keep original string value
 
         parsed_args[key] = value
