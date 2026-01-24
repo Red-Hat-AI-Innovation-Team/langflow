@@ -1,3 +1,6 @@
+from collections import defaultdict
+from unittest.mock import MagicMock
+
 import pytest
 from lfx.components.processing.data_operations import DataOperationsComponent
 from lfx.schema import Data
@@ -191,3 +194,83 @@ class TestDataOperationsComponent(ComponentTestBaseWithoutClient):
 
         with pytest.raises(ValueError, match="Select Keys operation is not supported for multiple data objects"):
             component.as_data()
+
+    def test_combine_updates_dependencies_in_cycle(self):
+        """Test that Combine re-adds data input dependencies for proper loop synchronization."""
+        # Create component with mock vertex and graph
+        data1 = Data(data={"key1": "value1"})
+        data2 = Data(data={"key2": "value2"})
+
+        component = DataOperationsComponent(
+            data=[data1, data2],
+            operations=[{"name": "Combine"}],
+        )
+
+        # Mock graph with run_manager
+        mock_graph = MagicMock()
+        mock_graph.run_manager.run_predecessors = defaultdict(list)
+        mock_graph.run_manager.run_map = defaultdict(list)
+
+        # Mock vertex with cycle edges and incoming data edges
+        # The graph property returns self._vertex.graph, so we set it on the mock_vertex
+        mock_vertex = MagicMock()
+        mock_vertex.has_cycle_edges = True
+        mock_vertex.incoming_edges = [
+            MagicMock(target_param="data", source_id="source1"),
+            MagicMock(target_param="data", source_id="source2"),
+        ]
+        mock_vertex.graph = mock_graph
+        component._vertex = mock_vertex
+
+        # Run combine
+        result = component.as_data()
+
+        # Verify result is correct
+        assert isinstance(result, Data)
+        assert "key1" in result.data
+        assert "key2" in result.data
+
+        # Verify dependencies were re-added
+        assert "source1" in mock_graph.run_manager.run_predecessors[component._id]
+        assert "source2" in mock_graph.run_manager.run_predecessors[component._id]
+
+        # Verify run_map was updated
+        assert component._id in mock_graph.run_manager.run_map["source1"]
+        assert component._id in mock_graph.run_manager.run_map["source2"]
+
+    def test_combine_does_not_update_dependencies_without_cycle(self):
+        """Test that Combine does not update dependencies when not in a cycle context."""
+        data1 = Data(data={"key1": "value1"})
+        data2 = Data(data={"key2": "value2"})
+
+        component = DataOperationsComponent(
+            data=[data1, data2],
+            operations=[{"name": "Combine"}],
+        )
+
+        # Mock graph with run_manager
+        mock_graph = MagicMock()
+        mock_graph.run_manager.run_predecessors = defaultdict(list)
+        mock_graph.run_manager.run_map = defaultdict(list)
+
+        # Mock vertex without cycle edges
+        mock_vertex = MagicMock()
+        mock_vertex.has_cycle_edges = False
+        mock_vertex.incoming_edges = [
+            MagicMock(target_param="data", source_id="source1"),
+            MagicMock(target_param="data", source_id="source2"),
+        ]
+        mock_vertex.graph = mock_graph
+        component._vertex = mock_vertex
+
+        # Run combine
+        result = component.as_data()
+
+        # Verify result is correct
+        assert isinstance(result, Data)
+        assert "key1" in result.data
+        assert "key2" in result.data
+
+        # Verify dependencies were NOT added (no cycle context)
+        assert "source1" not in mock_graph.run_manager.run_predecessors[component._id]
+        assert "source2" not in mock_graph.run_manager.run_predecessors[component._id]

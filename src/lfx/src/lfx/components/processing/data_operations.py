@@ -270,6 +270,38 @@ class DataOperationsComponent(Component):
         """Check if data contains multiple items."""
         return isinstance(self.data, list) and len(self.data) > 1
 
+    def _get_data_input_edges(self) -> list:
+        """Get all incoming edges that target the 'data' parameter."""
+        if self._vertex is None:
+            return []
+        return [edge for edge in self._vertex.incoming_edges if edge.target_param == "data"]
+
+    def _update_data_dependencies(self) -> None:
+        """Re-add all data input predecessors as dependencies for the next iteration.
+
+        This ensures the Combine operation won't execute again until ALL data input
+        predecessors have completed their execution in the next iteration. This is
+        critical for correct behavior in loops where inputs may complete at different times.
+        """
+        if self._vertex is None:
+            return
+
+        # Only needed for cycle contexts (loops)
+        if not self._vertex.has_cycle_edges:
+            return
+
+        data_edges = self._get_data_input_edges()
+
+        # Re-add each predecessor as a dependency
+        for edge in data_edges:
+            source_id = edge.source_id
+            # Add to run_predecessors if not already present
+            if source_id not in self.graph.run_manager.run_predecessors[self._id]:
+                self.graph.run_manager.run_predecessors[self._id].append(source_id)
+            # Also update run_map for proper cleanup
+            if self._id not in self.graph.run_manager.run_map[source_id]:
+                self.graph.run_manager.run_map[source_id].append(self._id)
+
     def validate_single_data(self, operation: str) -> None:
         """Validate that the operation is being performed on a single data object."""
         if self.data_is_list():
@@ -385,6 +417,9 @@ class DataOperationsComponent(Component):
 
         if evaluate:
             combined_data = self.recursive_eval(combined_data)
+
+        # Re-add data input dependencies for proper synchronization in loops
+        self._update_data_dependencies()
 
         return Data(**combined_data)
 
