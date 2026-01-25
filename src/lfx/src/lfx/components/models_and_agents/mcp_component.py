@@ -777,7 +777,42 @@ class MCPToolsComponent(ComponentWithCache):
                     value = getattr(self, arg.name, None)
                     if value is not None:
                         if isinstance(value, Message):
-                            kwargs[arg.name] = value.text
+                            text_value = value.text
+                            # Try to parse JSON for complex types (lists, dicts)
+                            # This fixes the issue where list[dict] types like tables_list
+                            # are passed as JSON strings instead of parsed Python objects
+                            try:
+                                parsed = json.loads(text_value)
+                                # Only use parsed value if it's a list or dict
+                                # Keep strings as-is to avoid breaking simple text inputs
+                                if isinstance(parsed, (list, dict)):
+                                    await logger.adebug(
+                                        f"Parsed JSON Message for {arg.name}: "
+                                        f"type={type(parsed).__name__}"
+                                    )
+                                    kwargs[arg.name] = parsed
+                                else:
+                                    kwargs[arg.name] = text_value
+                            except (json.JSONDecodeError, TypeError):
+                                kwargs[arg.name] = text_value
+                        elif isinstance(value, str):
+                            # Also try to parse raw strings that look like JSON arrays/objects
+                            # This handles cases where the input is not wrapped in a Message
+                            if value.startswith(("[", "{")):
+                                try:
+                                    parsed = json.loads(value)
+                                    if isinstance(parsed, (list, dict)):
+                                        await logger.adebug(
+                                            f"Parsed JSON string for {arg.name}: "
+                                            f"type={type(parsed).__name__}"
+                                        )
+                                        kwargs[arg.name] = parsed
+                                    else:
+                                        kwargs[arg.name] = value
+                                except (json.JSONDecodeError, TypeError):
+                                    kwargs[arg.name] = value
+                            else:
+                                kwargs[arg.name] = value
                         else:
                             kwargs[arg.name] = value
 
