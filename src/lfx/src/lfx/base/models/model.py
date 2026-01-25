@@ -84,10 +84,32 @@ class LCModelComponent(Component):
                 raise ValueError(msg)
 
     async def text_response(self) -> Message:
+        import time
+
+        # Log input
+        prompt_len = len(str(self.input_value)) if self.input_value else 0
+        system_len = len(self.system_message) if self.system_message else 0
+        model_name = getattr(self, "model_name", "unknown")
+        self.log(
+            f"[VERTEX] INPUT: prompt={prompt_len} chars, system={system_len} chars, model={model_name}",
+            name=f"[{self._id}]",
+        )
+
+        start = time.time()
         output = self.build_model()
         result = await self.get_chat_result(
             runnable=output, stream=self.stream, input_value=self.input_value, system_message=self.system_message
         )
+        elapsed = time.time() - start
+
+        # Log output
+        output_len = len(result.text) if hasattr(result, "text") and result.text else 0
+        output_preview = result.text[:80] if hasattr(result, "text") and result.text else "EMPTY"
+        self.log(
+            f"[VERTEX] OUTPUT: {output_len} chars in {elapsed:.2f}s, preview={output_preview}...",
+            name=f"[{self._id}]",
+        )
+
         self.status = result
         return result
 

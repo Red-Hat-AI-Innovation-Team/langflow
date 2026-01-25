@@ -95,6 +95,7 @@ class LoopComponent(Component):
 
         if self.evaluate_stop_loop():
             self.stop("item")
+            self.log("[LOOP] STOP - all items processed", name=f"[{self._id}]")
         else:
             # Get data list and current index
             data_list, current_index = self.loop_variables()
@@ -102,6 +103,16 @@ class LoopComponent(Component):
                 # Output current item and increment index
                 try:
                     current_item = data_list[current_index]
+                    # Log the emitted item
+                    item_preview = ""
+                    if hasattr(current_item, "data") and current_item.data:
+                        item_preview = str(current_item.data)[:100]
+                    else:
+                        item_preview = str(current_item)[:100]
+                    self.log(
+                        f"[LOOP] EMIT item {current_index + 1}/{len(data_list)}: {item_preview}...",
+                        name=f"[{self._id}]",
+                    )
                 except IndexError:
                     current_item = Data(text="")
             self.aggregated_output()
@@ -155,6 +166,18 @@ class LoopComponent(Component):
 
         # Append the current loop input to aggregated if it's not already included
         if loop_input is not None and not isinstance(loop_input, str) and len(aggregated) <= len(data_list):
+            # Log the received input
+            input_preview = ""
+            if isinstance(loop_input, Message):
+                input_preview = loop_input.text[:80] if loop_input.text else "EMPTY"
+            elif hasattr(loop_input, "data"):
+                input_preview = str(loop_input.data)[:80]
+            else:
+                input_preview = str(loop_input)[:80]
+            self.log(
+                f"[LOOP] RECV item {len(aggregated) + 1}: {input_preview}...",
+                name=f"[{self._id}]",
+            )
             # If the loop input is a Message, convert it to Data for consistency
             if isinstance(loop_input, Message):
                 loop_input = self._convert_message_to_data(loop_input)

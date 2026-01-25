@@ -4,7 +4,6 @@ import json
 import uuid
 
 from langchain_core.tools import StructuredTool  # noqa: TC002
-
 from lfx.base.agents.utils import maybe_unflatten_dict, safe_cache_get, safe_cache_set
 from lfx.base.mcp.util import (
     MCPStdioClient,
@@ -255,7 +254,9 @@ class MCPToolsComponent(ComponentWithCache):
 
     async def update_tool_list(self, mcp_server_value=None):
         # Accepts mcp_server_value as dict {name, config} or uses self.mcp_server
-        mcp_server = mcp_server_value if mcp_server_value is not None else getattr(self, "mcp_server", None)
+        mcp_server = (
+            mcp_server_value if mcp_server_value is not None else getattr(self, "mcp_server", None)
+        )
         server_name = None
         server_config_from_value = None
         if isinstance(mcp_server, dict):
@@ -443,7 +444,9 @@ class MCPToolsComponent(ComponentWithCache):
         else:
             return tool_list, {"name": server_name, "config": server_config}
 
-    async def update_build_config(self, build_config: dict, field_value: str, field_name: str | None = None) -> dict:
+    async def update_build_config(
+        self, build_config: dict, field_value: str, field_name: str | None = None
+    ) -> dict:
         """Toggle the visibility of connection-specific fields based on the selected mode."""
         try:
             if field_name == "tool":
@@ -453,7 +456,9 @@ class MCPToolsComponent(ComponentWithCache):
                     use_cache = getattr(self, "use_cache", False)
                     if len(self.tools) == 0 or not use_cache:
                         try:
-                            self.tools, build_config["mcp_server"]["value"] = await self.update_tool_list()
+                            self.tools, build_config["mcp_server"]["value"] = (
+                                await self.update_tool_list()
+                            )
                             build_config["tool"]["options"] = [tool.name for tool in self.tools]
                             build_config["tool"]["placeholder"] = "Select a tool"
                         except TimeoutError as e:
@@ -505,8 +510,12 @@ class MCPToolsComponent(ComponentWithCache):
 
                 build_config["tool_placeholder"]["tool_mode"] = True
 
-                current_server_name = field_value.get("name") if isinstance(field_value, dict) else field_value
-                _last_selected_server = safe_cache_get(self._shared_component_cache, "last_selected_server", "")
+                current_server_name = (
+                    field_value.get("name") if isinstance(field_value, dict) else field_value
+                )
+                _last_selected_server = safe_cache_get(
+                    self._shared_component_cache, "last_selected_server", ""
+                )
                 server_changed = current_server_name != _last_selected_server
 
                 # Determine if "Tool Mode" is active by checking if the tool dropdown is hidden.
@@ -529,7 +538,11 @@ class MCPToolsComponent(ComponentWithCache):
 
                 # To avoid unnecessary updates, only proceed if the server has actually changed
                 # OR if caching is disabled (to force refresh in non-tool mode)
-                if (_last_selected_server in (current_server_name, "")) and build_config["tool"]["show"] and use_cache:
+                if (
+                    (_last_selected_server in (current_server_name, ""))
+                    and build_config["tool"]["show"]
+                    and use_cache
+                ):
                     if current_server_name:
                         servers_cache = safe_cache_get(self._shared_component_cache, "servers", {})
                         if isinstance(servers_cache, dict):
@@ -541,7 +554,9 @@ class MCPToolsComponent(ComponentWithCache):
                                     return build_config
                     else:
                         return build_config
-                safe_cache_set(self._shared_component_cache, "last_selected_server", current_server_name)
+                safe_cache_set(
+                    self._shared_component_cache, "last_selected_server", current_server_name
+                )
 
                 # When cache is disabled, clear any cached data for this server
                 # This ensures we always fetch fresh data from the database
@@ -604,7 +619,9 @@ class MCPToolsComponent(ComponentWithCache):
 
             elif field_name == "tool_mode":
                 build_config["tool"]["placeholder"] = ""
-                build_config["tool"]["show"] = not bool(field_value) and bool(build_config["mcp_server"])
+                build_config["tool"]["show"] = not bool(field_value) and bool(
+                    build_config["mcp_server"]
+                )
                 self.remove_non_default_keys(build_config)
                 self.tool = build_config["tool"]["value"]
                 if field_value:
@@ -790,7 +807,9 @@ class MCPToolsComponent(ComponentWithCache):
                     item_dict = self.process_output_item(item_dict)
                     tool_content.append(item_dict)
 
-                if isinstance(tool_content, list) and all(isinstance(x, dict) for x in tool_content):
+                if isinstance(tool_content, list) and all(
+                    isinstance(x, dict) for x in tool_content
+                ):
                     return DataFrame(tool_content)
                 return DataFrame(data=tool_content)
             return DataFrame(data=[{"error": "You must select a tool"}])

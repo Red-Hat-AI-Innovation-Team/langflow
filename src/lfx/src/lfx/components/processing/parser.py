@@ -116,6 +116,19 @@ class ParserComponent(Component):
 
         df, data = self._clean_args()
 
+        # Log input
+        input_preview = ""
+        if df is not None:
+            input_preview = f"DataFrame({len(df)} rows)"
+        elif data is not None:
+            data_keys = list(data.data.keys())[:5] if hasattr(data, "data") else []
+            input_preview = f"Data(keys={data_keys})"
+        pattern_preview = self.pattern[:50] if self.pattern else "EMPTY"
+        self.log(
+            f"[PARSER] INPUT: {input_preview}, pattern={pattern_preview}...",
+            name=f"[{self._id}]",
+        )
+
         lines = []
         if df is not None:
             for _, row in df.iterrows():
@@ -131,6 +144,14 @@ class ParserComponent(Component):
             lines.append(formatted_text)
 
         combined_text = self.sep.join(lines)
+
+        # Log output
+        output_preview = combined_text[:80] if combined_text else "EMPTY"
+        self.log(
+            f"[PARSER] OUTPUT: {len(combined_text)} chars, preview={output_preview}...",
+            name=f"[{self._id}]",
+        )
+
         self.status = combined_text
         return Message(text=combined_text)
 

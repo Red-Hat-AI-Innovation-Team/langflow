@@ -297,45 +297,62 @@ class DataFrameOperationsComponent(Component):
         if not op:
             return df_copy
 
+        # Log input
+        input_shape = df_copy.shape if hasattr(df_copy, "shape") else "unknown"
+        filter_val = getattr(self, "filter_value", "")
+        col_name = getattr(self, "column_name", "")
+        self.log(
+            f"[DFOPS] INPUT: shape={input_shape}, operation={op}, column={col_name}, filter_value={filter_val}",
+            name=f"[{self._id}]",
+        )
+
+        result = None
         if op == "Filter":
-            return self.filter_rows_by_value(df_copy)
-        if op == "Sort":
-            return self.sort_by_column(df_copy)
-        if op == "Drop Column":
-            return self.drop_column(df_copy)
-        if op == "Rename Column":
-            return self.rename_column(df_copy)
-        if op == "Add Column":
-            return self.add_column(df_copy)
-        if op == "Select Columns":
-            return self.select_columns(df_copy)
-        if op == "Head":
-            return self.head(df_copy)
-        if op == "Tail":
-            return self.tail(df_copy)
-        if op == "Replace Value":
-            return self.replace_values(df_copy)
-        if op == "Drop Duplicates":
-            return self.drop_duplicates(df_copy)
-        if op == "Transpose":
-            return self.transpose(df_copy)
-        if op == "Reset Index":
-            return self.reset_index(df_copy)
-        if op == "Set Index":
-            return self.set_index(df_copy)
-        if op == "Fill NA":
-            return self.fill_na(df_copy)
-        if op == "Drop NA":
-            return self.drop_na(df_copy)
-        if op == "Sample":
-            return self.sample_rows(df_copy)
-        if op == "Slice":
-            return self.slice_rows(df_copy)
-        if op == "Unique Values":
-            return self.unique_values(df_copy)
-        msg = f"Unsupported operation: {op}"
-        logger.error(msg)
-        raise ValueError(msg)
+            result = self.filter_rows_by_value(df_copy)
+        elif op == "Sort":
+            result = self.sort_by_column(df_copy)
+        elif op == "Drop Column":
+            result = self.drop_column(df_copy)
+        elif op == "Rename Column":
+            result = self.rename_column(df_copy)
+        elif op == "Add Column":
+            result = self.add_column(df_copy)
+        elif op == "Select Columns":
+            result = self.select_columns(df_copy)
+        elif op == "Head":
+            result = self.head(df_copy)
+        elif op == "Tail":
+            result = self.tail(df_copy)
+        elif op == "Replace Value":
+            result = self.replace_values(df_copy)
+        elif op == "Drop Duplicates":
+            result = self.drop_duplicates(df_copy)
+        elif op == "Transpose":
+            result = self.transpose(df_copy)
+        elif op == "Reset Index":
+            result = self.reset_index(df_copy)
+        elif op == "Set Index":
+            result = self.set_index(df_copy)
+        elif op == "Fill NA":
+            result = self.fill_na(df_copy)
+        elif op == "Drop NA":
+            result = self.drop_na(df_copy)
+        elif op == "Sample":
+            result = self.sample_rows(df_copy)
+        elif op == "Slice":
+            result = self.slice_rows(df_copy)
+        elif op == "Unique Values":
+            result = self.unique_values(df_copy)
+        else:
+            msg = f"Unsupported operation: {op}"
+            logger.error(msg)
+            raise ValueError(msg)
+
+        # Log output
+        output_shape = result.shape if hasattr(result, "shape") else "unknown"
+        self.log(f"[DFOPS] OUTPUT: shape={output_shape}", name=f"[{self._id}]")
+
+        return result
 
     def filter_rows_by_value(self, df: DataFrame) -> DataFrame:
         column = df[self.column_name]
