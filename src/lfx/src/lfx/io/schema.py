@@ -188,9 +188,13 @@ def schema_to_langflow_inputs(schema: type[BaseModel]) -> list[InputTypes]:
         # 4) Primitive via your mapping
         try:
             lf_cls = _convert_type_to_field_type[ann]
-        except KeyError as err:
-            msg = f"Unsupported field type: {ann}"
-            raise TypeError(msg) from err
+        except KeyError:
+            if isinstance(ann, type) and issubclass(ann, BaseModel):
+                # Fallback for Pydantic models (e.g., empty AnonModel) - treat as dict
+                lf_cls = DictInput
+            else:
+                msg = f"Unsupported field type: {ann}"
+                raise TypeError(msg) from None
         inputs.append(
             lf_cls(
                 display_name=model_field.title or field_name.replace("_", " ").title(),
