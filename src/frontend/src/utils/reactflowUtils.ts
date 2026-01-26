@@ -364,16 +364,13 @@ export function detectBrokenEdgesEdges(nodes: AllNodeType[], edges: Edge[]) {
         );
         if (output) {
           // Match the handle ID generation logic from NodeOutputParameter
+          // Normal output edges use only [selectedType], not loop_types
           const selectedType = output.selected ?? output.types[0];
-          const outputTypes =
-            output.allows_loop && output.loop_types
-              ? [selectedType, ...output.loop_types]
-              : [selectedType];
 
           const id: sourceHandleType = {
             id: sourceNode.data.id,
             name: name,
-            output_types: outputTypes,
+            output_types: [selectedType],
             dataType: sourceNode.data.type,
           };
           if (scapedJSONStringfy(id) !== sourceHandle) {
