@@ -80,6 +80,17 @@ def flatten_schema(root_schema: dict[str, Any]) -> dict[str, Any]:
         # ── arrays (always recurse into the first item as "[0]") ───────────
         if t == "array":
             items = schema.get("items", {})
+            items = _resolve_if_ref(items)
+            # If items is an empty object (no properties), treat the whole array as a leaf
+            # This handles list[dict] parameters from MCP tools
+            if items.get("type") == "object" and not items.get("properties"):
+                leaf: dict[str, Any] = {"type": "array", "items": {"type": "object"}}
+                if "description" in schema:
+                    leaf["description"] = schema["description"]
+                flat_props[name] = leaf
+                if inherited_req:
+                    required_list.append(name)
+                return
             _walk(name=f"{name}[0]", schema=items, inherited_req=inherited_req)
             return
 
