@@ -156,7 +156,20 @@ def schema_to_langflow_inputs(schema: type[BaseModel]) -> list[InputTypes]:
 
         if get_origin(ann) is list:
             is_list = True
-            ann = get_args(ann)[0]
+            inner_type = get_args(ann)[0]
+            # Special case: list[dict] should use text input - user pastes JSON
+            # The MCP component will parse the string to the appropriate type
+            if inner_type is dict:
+                inputs.append(
+                    MessageTextInput(
+                        display_name=model_field.title or field_name.replace("_", " ").title(),
+                        name=field_name,
+                        info=model_field.description or "",
+                        required=model_field.is_required(),
+                    )
+                )
+                continue
+            ann = inner_type
 
         options: list[Any] | None = None
         if get_origin(ann) is Literal:
