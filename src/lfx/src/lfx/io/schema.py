@@ -12,7 +12,6 @@ from lfx.inputs.inputs import (
     InputTypes,
     IntInput,
     MessageTextInput,
-    TableInput,
 )
 from lfx.schema.dotdict import dotdict
 
@@ -157,19 +156,7 @@ def schema_to_langflow_inputs(schema: type[BaseModel]) -> list[InputTypes]:
 
         if get_origin(ann) is list:
             is_list = True
-            inner_type = get_args(ann)[0]
-            # Special case: list[dict] should use TableInput for better UI
-            if inner_type is dict:
-                inputs.append(
-                    TableInput(
-                        display_name=model_field.title or field_name.replace("_", " ").title(),
-                        name=field_name,
-                        info=model_field.description or "",
-                        required=model_field.is_required(),
-                    )
-                )
-                continue
-            ann = inner_type
+            ann = get_args(ann)[0]
 
         options: list[Any] | None = None
         if get_origin(ann) is Literal:
