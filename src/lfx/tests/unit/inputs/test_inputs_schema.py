@@ -239,3 +239,69 @@ def test_schema_to_langflow_inputs_invalid_type():
     # Test that attempting to convert an unsupported type raises TypeError
     with pytest.raises(TypeError, match="Unsupported field type:"):
         schema_to_langflow_inputs(InvalidSchema)
+
+
+def test_flatten_schema_array_of_empty_objects():
+    """Test that flatten_schema preserves arrays of empty objects as leaf nodes.
+
+    This is critical for MCP tools with list[dict] parameters like get_sql's tables_list.
+    Without this fix, the parameter would be dropped entirely from the flattened schema.
+    """
+    from lfx.io.schema import flatten_schema
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "tables_list": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": "List of table schemas",
+            },
+        },
+        "required": ["query", "tables_list"],
+    }
+
+    flat = flatten_schema(schema)
+
+    # Both fields should be preserved
+    assert "query" in flat["properties"]
+    assert "tables_list" in flat["properties"]
+
+    # tables_list should be an array type, not flattened to tables_list[0]
+    tables_list_prop = flat["properties"]["tables_list"]
+    assert tables_list_prop["type"] == "array"
+    assert tables_list_prop["items"] == {"type": "object"}
+    assert tables_list_prop["description"] == "List of table schemas"
+
+    # Both should be in required
+    assert "query" in flat["required"]
+    assert "tables_list" in flat["required"]
+
+
+def test_flatten_schema_array_of_objects_with_properties():
+    """Test that arrays of objects WITH properties still get flattened normally."""
+    from lfx.io.schema import flatten_schema
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+        "required": ["items"],
+    }
+
+    flat = flatten_schema(schema)
+
+    # Should be flattened to items[0].name
+    assert "items[0].name" in flat["properties"]
+    assert flat["properties"]["items[0].name"]["type"] == "string"

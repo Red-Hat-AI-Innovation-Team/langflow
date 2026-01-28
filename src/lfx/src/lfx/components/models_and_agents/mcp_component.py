@@ -22,6 +22,39 @@ from lfx.schema.message import Message
 from lfx.services.deps import get_settings_service, get_storage_service, session_scope
 
 
+def _try_parse_value(value):
+    """Try to parse a string value as JSON or Python literal.
+
+    Returns the parsed value if successful, otherwise returns the original string.
+    This allows users to paste JSON arrays/objects as text input values.
+    """
+    import ast
+
+    if not isinstance(value, str):
+        return value
+
+    # Skip if it doesn't look like JSON/Python literal
+    stripped = value.strip()
+    if not stripped:
+        return value
+    if stripped[0] not in "[{\"'0123456789-tfnTFN":
+        return value
+
+    # Try JSON first (more common for MCP tools)
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Fall back to ast.literal_eval for Python literals
+    try:
+        return ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        pass
+
+    return value
+
+
 def resolve_mcp_config(
     server_name: str,  # noqa: ARG001
     server_config_from_value: dict | None,
@@ -777,9 +810,11 @@ class MCPToolsComponent(ComponentWithCache):
                     value = getattr(self, arg.name, None)
                     if value is not None:
                         if isinstance(value, Message):
-                            kwargs[arg.name] = value.text
-                        else:
-                            kwargs[arg.name] = value
+                            value = value.text
+                        # Try to parse string values as JSON/Python literals
+                        # This handles list[dict] and other complex types pasted as text
+                        value = _try_parse_value(value)
+                        kwargs[arg.name] = value
 
                 unflattened_kwargs = maybe_unflatten_dict(kwargs)
 
