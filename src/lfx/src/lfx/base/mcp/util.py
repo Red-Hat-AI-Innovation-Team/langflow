@@ -950,8 +950,8 @@ class MCPSessionManager:
         except Exception as e:  # noqa: BLE001
             await logger.awarning(f"Error cleaning up session {session_id}: {e}")
         finally:
-            # Remove from sessions dict
-            del sessions[session_id]
+            # Remove from sessions dict (safe if already removed by concurrent cleanup)
+            sessions.pop(session_id, None)
 
     async def cleanup_all(self):
         """Clean up all sessions."""
