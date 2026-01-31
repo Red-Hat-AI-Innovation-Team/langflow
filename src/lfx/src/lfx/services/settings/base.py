@@ -113,8 +113,26 @@ class Settings(BaseSettings):
     reap idle sessions."""
 
     # sqlite configuration
-    sqlite_pragmas: dict | None = {"synchronous": "NORMAL", "journal_mode": "WAL", "busy_timeout": 30000}
-    """SQLite pragmas to use when connecting to the database."""
+    sqlite_pragmas: dict | None = {
+        "synchronous": "NORMAL",
+        "journal_mode": "WAL",
+        "busy_timeout": 60000,
+        "cache_size": -64000,
+        "temp_store": "MEMORY",
+        "mmap_size": 268435456,
+        "wal_autocheckpoint": 5000,
+    }
+    """SQLite pragmas to use when connecting to the database.
+
+    Optimizations configured:
+    - synchronous: NORMAL (WAL mode - less durable but faster)
+    - journal_mode: WAL (non-blocking readers/writers)
+    - busy_timeout: 60000ms (wait 60s for lock release)
+    - cache_size: -64000KB = 64MB (reduces disk I/O)
+    - temp_store: MEMORY (faster temporary tables)
+    - mmap_size: 268435456 = 256MB (memory-mapped I/O for faster reads/writes)
+    - wal_autocheckpoint: 5000 pages (less frequent checkpoints for bursty writes)
+    """
 
     db_driver_connection_settings: dict | None = None
     """Database driver connection settings."""
