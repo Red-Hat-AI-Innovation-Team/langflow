@@ -138,8 +138,8 @@ class Settings(BaseSettings):
     """Database driver connection settings."""
 
     db_connection_settings: dict | None = {
-        "pool_size": 20,  # Match the pool_size above
-        "max_overflow": 30,  # Match the max_overflow above
+        "pool_size": 100,  # Increased from 20 for high-concurrency (100+ concurrent requests)
+        "max_overflow": 150,  # Increased from 30. Total max = pool_size + max_overflow = 250
         "pool_timeout": 30,  # Seconds to wait for a connection from pool
         "pool_pre_ping": True,  # Check connection validity before using
         "pool_recycle": 1800,  # Recycle connections after 30 minutes
