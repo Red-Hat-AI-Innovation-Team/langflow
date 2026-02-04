@@ -467,6 +467,9 @@ class MCPSessionManager:
     5. Transport preference caching to avoid retrying failed transports
     """
 
+    # Skip health check if session was validated within this many seconds
+    HEALTH_CHECK_GRACE_PERIOD = 5.0
+
     def __init__(self):
         # Structure: server_key -> {"sessions": {session_id: session_info}, "last_cleanup": timestamp}
         self.sessions_by_server = {}
@@ -483,6 +486,8 @@ class MCPSessionManager:
         # Lock for creating server-level locks
         self._lock_lock = asyncio.Lock()
         self._cleanup_task = None
+        # Track last successful health check time per session to avoid redundant checks
+        self._last_health_check: dict[str, float] = {}
         self._start_cleanup_task()
 
     def _start_cleanup_task(self):
@@ -617,6 +622,8 @@ class MCPSessionManager:
 
         # All session operations now inside lock - atomic
         async with self._server_locks[server_key]:
+            current_time = asyncio.get_event_loop().time()
+
             # Try to find a healthy existing session
             for session_id, session_info in list(sessions.items()):
                 session = session_info["session"]
@@ -625,22 +632,38 @@ class MCPSessionManager:
                 # Check if session is still alive
                 if not task.done():
                     # Update last used time
-                    session_info["last_used"] = asyncio.get_event_loop().time()
+                    session_info["last_used"] = current_time
 
-                    # Quick health check
-                    if await self._validate_session_connectivity(session):
-                        await logger.adebug(f"Reusing existing session {session_id} for server {server_key}")
-                        # record mapping & bump ref-count for backwards compatibility
-                        self._context_to_session[context_id] = (server_key, session_id)
-                        self._session_refcount[(server_key, session_id)] = (
-                            self._session_refcount.get((server_key, session_id), 0) + 1
+                    # Skip health check if session was recently validated (within grace period)
+                    last_check = self._last_health_check.get(session_id, 0)
+                    skip_health_check = current_time - last_check < self.HEALTH_CHECK_GRACE_PERIOD
+
+                    if skip_health_check:
+                        await logger.adebug(
+                            f"Reusing session {session_id} (skipped health check, last check {current_time - last_check:.1f}s ago)"
                         )
-                        return session
-                    await logger.ainfo(f"Session {session_id} for server {server_key} failed health check, cleaning up")
-                    await self._cleanup_session_by_id(server_key, session_id)
+                    elif await self._validate_session_connectivity(session):
+                        await logger.adebug(f"Reusing existing session {session_id} for server {server_key}")
+                        self._last_health_check[session_id] = current_time
+                    else:
+                        # Health check failed - clean up and continue to next session
+                        await logger.ainfo(
+                            f"Session {session_id} for server {server_key} failed health check, cleaning up"
+                        )
+                        self._last_health_check.pop(session_id, None)
+                        await self._cleanup_session_by_id(server_key, session_id)
+                        continue
+
+                    # Session is valid - register and return
+                    self._context_to_session[context_id] = (server_key, session_id)
+                    self._session_refcount[(server_key, session_id)] = (
+                        self._session_refcount.get((server_key, session_id), 0) + 1
+                    )
+                    return session
                 else:
                     # Task is done, clean up
                     await logger.ainfo(f"Session {session_id} for server {server_key} task is done, cleaning up")
+                    self._last_health_check.pop(session_id, None)
                     await self._cleanup_session_by_id(server_key, session_id)
 
             # Check if we've reached the maximum number of sessions for this server
@@ -678,6 +701,8 @@ class MCPSessionManager:
                 "type": actual_transport,
                 "last_used": asyncio.get_event_loop().time(),
             }
+            # Record initial health check time for the new session
+            self._last_health_check[session_id] = asyncio.get_event_loop().time()
 
             # register mapping & initial ref-count for the new session
             self._context_to_session[context_id] = (server_key, session_id)
@@ -963,6 +988,8 @@ class MCPSessionManager:
         finally:
             # Remove from sessions dict (safe if already removed by concurrent cleanup)
             sessions.pop(session_id, None)
+            # Clear health check cache for this session
+            self._last_health_check.pop(session_id, None)
 
     async def cleanup_all(self):
         """Clean up all sessions."""
@@ -991,6 +1018,7 @@ class MCPSessionManager:
         # Clear compatibility maps
         self._context_to_session.clear()
         self._session_refcount.clear()
+        self._last_health_check.clear()
 
         # Clear all background tasks
         for task in list(self._background_tasks):

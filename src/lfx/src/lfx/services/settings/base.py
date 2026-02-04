@@ -92,17 +92,17 @@ class Settings(BaseSettings):
     If not provided, a hash of the database URL will be used. Useful when multiple Langflow
     instances share the same database and need coordinated migration locking."""
 
-    mcp_server_timeout: int = 20
-    """The number of seconds to wait before giving up on a lock to released or establishing a connection to the
-    database."""
+    mcp_server_timeout: int = 120
+    """The number of seconds to wait before giving up on establishing a connection to the
+    MCP server. Increased from 20s to handle high-concurrency scenarios."""
 
     # ---------------------------------------------------------------------
     # MCP Session-manager tuning
     # ---------------------------------------------------------------------
-    mcp_max_sessions_per_server: int = 10
+    mcp_max_sessions_per_server: int = 50
     """Maximum number of MCP sessions to keep per unique server (command/url).
-    Mirrors the default constant MAX_SESSIONS_PER_SERVER in util.py. Adjust to
-    control resource usage or concurrency per server."""
+    Increased from 10 to 50 to support high-concurrency evaluation scenarios.
+    Adjust to control resource usage or concurrency per server."""
 
     mcp_session_idle_timeout: int = 400  # seconds
     """How long (in seconds) an MCP session can stay idle before the background
