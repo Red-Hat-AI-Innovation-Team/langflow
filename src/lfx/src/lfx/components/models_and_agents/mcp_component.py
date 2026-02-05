@@ -93,9 +93,7 @@ class MCPToolsComponent(ComponentWithCache):
         self._ensure_cache_structure()
 
         # Initialize clients with access to the component cache
-        self.stdio_client: MCPStdioClient = MCPStdioClient(
-            component_cache=self._shared_component_cache
-        )
+        self.stdio_client: MCPStdioClient = MCPStdioClient(component_cache=self._shared_component_cache)
         self.streamable_http_client: MCPStreamableHttpClient = MCPStreamableHttpClient(
             component_cache=self._shared_component_cache
         )
@@ -136,9 +134,7 @@ class MCPToolsComponent(ComponentWithCache):
             try:
                 from redhat_agents.auth.mcp_oauth import MCPOAuthClient
             except ImportError:
-                raise ImportError(
-                    "MCPOAuthClient not found, please ensure the redhat_agents package is installed."
-                )
+                raise ImportError("MCPOAuthClient not found, please ensure the redhat_agents package is installed.")
 
             from urllib.parse import urlparse
 
@@ -406,9 +402,7 @@ class MCPToolsComponent(ComponentWithCache):
                         f"{server_config.get('url', 'unknown')}"
                     )
                 else:
-                    await logger.awarning(
-                        "OAuth enabled but server is not HTTP-based, skipping header injection"
-                    )
+                    await logger.awarning("OAuth enabled but server is not HTTP-based, skipping header injection")
 
             try:
                 _, tool_list, tool_cache = await update_tools(
@@ -425,14 +419,11 @@ class MCPToolsComponent(ComponentWithCache):
                     for sub_exc in tool_error.exceptions:
                         actual_errors.append(f"{type(sub_exc).__name__}: {sub_exc}")
                 elif hasattr(tool_error, "__cause__") and tool_error.__cause__:
-                    actual_errors.append(
-                        f"Cause: {type(tool_error.__cause__).__name__}: {tool_error.__cause__}"
-                    )
+                    actual_errors.append(f"Cause: {type(tool_error.__cause__).__name__}: {tool_error.__cause__}")
 
                 if actual_errors:
                     await logger.aerror(
-                        f"MCP connection failed for {server_name}. "
-                        f"Root causes: {'; '.join(actual_errors)}"
+                        f"MCP connection failed for {server_name}. Root causes: {'; '.join(actual_errors)}"
                     )
                 raise
 
@@ -462,13 +453,9 @@ class MCPToolsComponent(ComponentWithCache):
         except Exception as e:
             # Check for authentication errors - clear OAuth token to force re-authentication
             error_str = str(e).lower()
-            if ("401" in error_str or "unauthorized" in error_str) and getattr(
-                self, "enable_oauth", False
-            ):
+            if ("401" in error_str or "unauthorized" in error_str) and getattr(self, "enable_oauth", False):
                 self._oauth_token = None
-                await logger.awarning(
-                    "401 Unauthorized - clearing OAuth token for re-authentication"
-                )
+                await logger.awarning("401 Unauthorized - clearing OAuth token for re-authentication")
 
             msg = f"Error updating tool list: {e!s}"
             await logger.aexception(msg)
@@ -796,13 +783,15 @@ class MCPToolsComponent(ComponentWithCache):
     async def build_output(self) -> DataFrame:
         """Build output with improved error handling and validation."""
         try:
+            # Set session context BEFORE update_tool_list() to ensure sessions acquired
+            # during tool discovery use the correct context (prevents session leaks)
+            session_context = self._get_session_context()
+            if session_context:
+                self.stdio_client.set_session_context(session_context)
+                self.streamable_http_client.set_session_context(session_context)
+
             self.tools, _ = await self.update_tool_list()
             if self.tool != "":
-                # Set session context for persistent MCP sessions using Langflow session ID
-                session_context = self._get_session_context()
-                if session_context:
-                    self.stdio_client.set_session_context(session_context)
-                    self.streamable_http_client.set_session_context(session_context)
                 exec_tool = self._tool_cache[self.tool]
                 tool_args = self.get_inputs_for_all_tools(self.tools)[self.tool]
                 kwargs = {}
