@@ -621,7 +621,7 @@ class MCPSessionManager:
         import time
 
         t0 = time.perf_counter()
-        await logger.ainfo(f"[GS] get_session START context={context_id} transport={transport_type}")
+        await logger.awarning(f"[GS] get_session START context={context_id} transport={transport_type}")
 
         server_key = self._get_server_key(connection_params, transport_type)
         wait_timeout = get_session_wait_timeout()
@@ -687,7 +687,7 @@ class MCPSessionManager:
                         self._session_refcount[(server_key, session_id)] = (
                             self._session_refcount.get((server_key, session_id), 0) + 1
                         )
-                        await logger.ainfo(
+                        await logger.awarning(
                             f"[GS] REUSING session {session_id} after {(time.perf_counter() - t0) * 1000:.1f}ms"
                         )
                         return session
@@ -704,8 +704,8 @@ class MCPSessionManager:
 
                 # At max capacity and all sessions in use - wait for one to become available
                 in_use_count = sum(1 for s in sessions.values() if s.get("in_use", False))
-                await logger.adebug(
-                    f"Sessions: {len(sessions)}/{get_max_sessions_per_server()}, in_use: {in_use_count}"
+                await logger.awarning(
+                    f"[GS] WAITING: sessions={len(sessions)}/{get_max_sessions_per_server()}, in_use={in_use_count}"
                 )
 
                 waited = current_time - wait_start
@@ -730,7 +730,7 @@ class MCPSessionManager:
 
             # Create new session
             session_id = f"{server_key}_{len(sessions)}"
-            await logger.ainfo(
+            await logger.awarning(
                 f"[GS] CREATING new session {session_id} after {(time.perf_counter() - t0) * 1000:.1f}ms"
             )
 

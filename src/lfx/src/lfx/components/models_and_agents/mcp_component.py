@@ -286,7 +286,7 @@ class MCPToolsComponent(ComponentWithCache):
         import time
 
         t0 = time.perf_counter()
-        await logger.ainfo(f"[UTL] update_tool_list START")
+        await logger.awarning(f"[UTL] update_tool_list START")
 
         # Accepts mcp_server_value as dict {name, config} or uses self.mcp_server
         mcp_server = mcp_server_value if mcp_server_value is not None else getattr(self, "mcp_server", None)
@@ -299,7 +299,7 @@ class MCPToolsComponent(ComponentWithCache):
             server_name = mcp_server
         if not server_name:
             self.tools = []
-            await logger.ainfo(f"[UTL] No server_name, returning empty after {(time.perf_counter() - t0) * 1000:.1f}ms")
+            await logger.awarning(f"[UTL] No server_name, returning empty after {(time.perf_counter() - t0) * 1000:.1f}ms")
             return [], {"name": server_name, "config": server_config_from_value}
 
         # Check if caching is enabled, default to False
@@ -360,7 +360,7 @@ class MCPToolsComponent(ComponentWithCache):
                     storage_service=get_storage_service(),
                     settings_service=get_settings_service(),
                 )
-            await logger.ainfo(f"[UTL] DB fetch done at {(time.perf_counter() - t0) * 1000:.1f}ms")
+            await logger.awarning(f"[UTL] DB fetch done at {(time.perf_counter() - t0) * 1000:.1f}ms")
 
             # Resolve config with proper precedence: DB takes priority, falls back to value
             server_config = resolve_mcp_config(
