@@ -830,20 +830,24 @@ class MCPSessionManager:
                 )
                 return session
 
-            except Exception as e:
-                # Creation failed - remove the placeholder and notify waiters
+            except BaseException as e:
+                # Creation failed or was cancelled - remove the placeholder and notify waiters
+                # Use BaseException to catch CancelledError which is not a subclass of Exception
                 print(
-                    f"[MCP-GS] CREATE_FAILED session={session_id} ctx={context_id[:20]} error={e}",
+                    f"[MCP-GS] CREATE_FAILED session={session_id} ctx={context_id[:20]} error={type(e).__name__}: {e}",
                     file=sys.stderr,
                     flush=True,
                 )
-                async with condition:
-                    server_data = self.sessions_by_server[server_key]
-                    sessions = server_data["sessions"]
-                    sessions.pop(session_id, None)
-                    self._last_health_check.pop(session_id, None)
-                    # Notify waiters that a slot is now available
-                    condition.notify_all()
+                try:
+                    async with condition:
+                        server_data = self.sessions_by_server[server_key]
+                        sessions = server_data["sessions"]
+                        sessions.pop(session_id, None)
+                        self._last_health_check.pop(session_id, None)
+                        # Notify waiters that a slot is now available
+                        condition.notify_all()
+                except Exception:
+                    pass  # Best effort cleanup
                 raise
 
         # This should not be reached - defensive error
