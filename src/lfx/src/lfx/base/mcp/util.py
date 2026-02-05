@@ -50,7 +50,7 @@ def _get_mcp_setting(key: str, default: Any = None) -> Any:
 
 def get_max_sessions_per_server() -> int:
     """Get maximum number of sessions per server to prevent resource exhaustion."""
-    return _get_mcp_setting("mcp_max_sessions_per_server", 100)
+    return _get_mcp_setting("mcp_max_sessions_per_server", 20)
 
 
 def get_session_wait_timeout() -> int:
