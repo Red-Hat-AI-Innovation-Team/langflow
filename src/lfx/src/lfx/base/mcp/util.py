@@ -1045,7 +1045,7 @@ class MCPSessionManager:
     async def release_session(self, context_id: str):
         """Release a session back to the pool after use.
 
-        Marks the session as no longer in use, allowing other requests to use it.
+        Decrements the refcount for this context's session and marks it as not in use.
         Call this when done with a session obtained from get_session().
         """
         mapping = self._context_to_session.get(context_id)
@@ -1054,14 +1054,25 @@ class MCPSessionManager:
             return
 
         server_key, session_id = mapping
+        ref_key = (server_key, session_id)
 
-        # Find and release the session
+        # Decrement refcount (symmetric with get_session increment)
+        remaining = self._session_refcount.get(ref_key, 1) - 1
+        if remaining <= 0:
+            self._session_refcount.pop(ref_key, None)
+        else:
+            self._session_refcount[ref_key] = remaining
+
+        # Remove the context mapping (this context is done with the session)
+        self._context_to_session.pop(context_id, None)
+
+        # Mark session as not in use (available for other requests)
         if server_key in self.sessions_by_server:
             server_data = self.sessions_by_server[server_key]
             sessions = server_data.get("sessions", {})
             if session_id in sessions:
                 sessions[session_id]["in_use"] = False
-                await logger.adebug(f"Released session {session_id} for server {server_key}")
+                await logger.adebug(f"Released session {session_id} for server {server_key} (refcount: {remaining})")
 
         # Notify waiters that a session is available
         await self._notify_session_available(server_key)
@@ -1183,9 +1194,19 @@ class MCPStdioClient:
 
         # Get or create a persistent session
         session = await self._get_or_create_session()
-        response = await session.list_tools()
-        self._connected = True
-        return response.tools
+        try:
+            response = await session.list_tools()
+            self._connected = True
+            return response.tools
+        finally:
+            # Release session back to pool after listing tools
+            # This ensures the session is available for run_tool() or other requests
+            if self._session_context:
+                try:
+                    session_manager = self._get_session_manager()
+                    await session_manager.release_session(self._session_context)
+                except Exception:  # noqa: BLE001
+                    pass  # Best effort release
 
     async def connect_to_server(self, command_str: str, env: dict[str, str] | None = None) -> list[StructuredTool]:
         """Connect to MCP server using stdio transport (SDK style)."""
@@ -1448,9 +1469,19 @@ class MCPStreamableHttpClient:
 
         # Get or create a persistent session (will try Streamable HTTP, then SSE fallback)
         session = await self._get_or_create_session()
-        response = await session.list_tools()
-        self._connected = True
-        return response.tools
+        try:
+            response = await session.list_tools()
+            self._connected = True
+            return response.tools
+        finally:
+            # Release session back to pool after listing tools
+            # This ensures the session is available for run_tool() or other requests
+            if self._session_context:
+                try:
+                    session_manager = self._get_session_manager()
+                    await session_manager.release_session(self._session_context)
+                except Exception:  # noqa: BLE001
+                    pass  # Best effort release
 
     async def connect_to_server(
         self,
