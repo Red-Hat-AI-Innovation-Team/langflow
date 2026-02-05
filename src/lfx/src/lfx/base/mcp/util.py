@@ -948,28 +948,41 @@ class MCPSessionManager:
 
         async def session_task():
             """Background task that keeps the session alive."""
+            import time
+
             streamable_error = None
+            task_start = time.monotonic()
+
+            def elapsed_ms() -> str:
+                return f"{(time.monotonic() - task_start) * 1000:.1f}ms"
 
             # Skip Streamable HTTP if we know SSE works for this server
             if preferred_transport != "sse":
                 # Try Streamable HTTP first with a quick timeout
                 try:
-                    await logger.adebug(f"Attempting Streamable HTTP connection for session {session_id}")
+                    print(f"[MCP-TASK] {session_id} START transport=streamable_http {elapsed_ms()}")
                     # Use a shorter timeout for the initial connection attempt (2 seconds)
+                    print(f"[MCP-TASK] {session_id} ENTERING_CLIENT_CTX {elapsed_ms()}")
                     async with streamablehttp_client(
                         url=connection_params["url"],
                         headers=connection_params["headers"],
                         timeout=connection_params["timeout_seconds"],
                         httpx_client_factory=custom_httpx_factory,
                     ) as (read, write, _):
+                        print(f"[MCP-TASK] {session_id} CLIENT_CTX_ENTERED {elapsed_ms()}")
                         session = ClientSession(read, write)
+                        print(f"[MCP-TASK] {session_id} CLIENT_SESSION_CREATED {elapsed_ms()}")
                         async with session:
+                            print(f"[MCP-TASK] {session_id} SESSION_CTX_ENTERED {elapsed_ms()}")
                             # Initialize with a timeout to fail fast
+                            print(f"[MCP-TASK] {session_id} CALLING_INITIALIZE {elapsed_ms()}")
                             await asyncio.wait_for(session.initialize(), timeout=5.0)
+                            print(f"[MCP-TASK] {session_id} INITIALIZE_DONE {elapsed_ms()}")
                             used_transport.append("streamable_http")
                             await logger.ainfo(f"Session {session_id} connected via Streamable HTTP")
                             # Signal that session is ready
                             session_future.set_result(session)
+                            print(f"[MCP-TASK] {session_id} FUTURE_SET {elapsed_ms()}")
 
                             # Keep the session alive until cancelled
                             import anyio
@@ -978,24 +991,31 @@ class MCPSessionManager:
                             try:
                                 await event.wait()
                             except asyncio.CancelledError:
+                                print(f"[MCP-TASK] {session_id} CANCELLED {elapsed_ms()}")
                                 await logger.ainfo(f"Session {session_id} (Streamable HTTP) is shutting down")
                 except (asyncio.TimeoutError, Exception) as e:  # noqa: BLE001
                     # If Streamable HTTP fails or times out, try SSE as fallback immediately
                     streamable_error = e
                     error_type = "timed out" if isinstance(e, asyncio.TimeoutError) else "failed"
+                    print(
+                        f"[MCP-TASK] {session_id} STREAMABLE_HTTP_FAILED error={type(e).__name__}: {e} {elapsed_ms()}"
+                    )
                     await logger.awarning(
                         f"Streamable HTTP {error_type} for session {session_id}: {e}. Falling back to SSE..."
                     )
             else:
+                print(f"[MCP-TASK] {session_id} SKIP_STREAMABLE_HTTP using_sse_preference {elapsed_ms()}")
                 await logger.adebug(f"Skipping Streamable HTTP for session {session_id}, using cached SSE preference")
 
             # Try SSE if Streamable HTTP failed or if SSE is preferred
             if streamable_error is not None or preferred_transport == "sse":
                 try:
+                    print(f"[MCP-TASK] {session_id} START_SSE_FALLBACK {elapsed_ms()}")
                     await logger.adebug(f"Attempting SSE connection for session {session_id}")
                     # Extract SSE read timeout from connection params, default to 30s if not present
                     sse_read_timeout = connection_params.get("sse_read_timeout_seconds", 30)
 
+                    print(f"[MCP-TASK] {session_id} SSE_ENTERING_CLIENT_CTX {elapsed_ms()}")
                     async with sse_client(
                         connection_params["url"],
                         connection_params["headers"],
@@ -1003,15 +1023,19 @@ class MCPSessionManager:
                         sse_read_timeout,
                         httpx_client_factory=custom_httpx_factory,
                     ) as (read, write):
+                        print(f"[MCP-TASK] {session_id} SSE_CLIENT_CTX_ENTERED {elapsed_ms()}")
                         session = ClientSession(read, write)
                         async with session:
+                            print(f"[MCP-TASK] {session_id} SSE_CALLING_INITIALIZE {elapsed_ms()}")
                             await session.initialize()
+                            print(f"[MCP-TASK] {session_id} SSE_INITIALIZE_DONE {elapsed_ms()}")
                             used_transport.append("sse")
                             fallback_msg = " (fallback)" if streamable_error else " (preferred)"
                             await logger.ainfo(f"Session {session_id} connected via SSE{fallback_msg}")
                             # Signal that session is ready
                             if not session_future.done():
                                 session_future.set_result(session)
+                            print(f"[MCP-TASK] {session_id} SSE_FUTURE_SET {elapsed_ms()}")
 
                             # Keep the session alive until cancelled
                             import anyio
@@ -1020,9 +1044,13 @@ class MCPSessionManager:
                             try:
                                 await event.wait()
                             except asyncio.CancelledError:
+                                print(f"[MCP-TASK] {session_id} SSE_CANCELLED {elapsed_ms()}")
                                 await logger.ainfo(f"Session {session_id} (SSE) is shutting down")
                 except Exception as sse_error:  # noqa: BLE001
                     # Both transports failed (or just SSE if it was preferred)
+                    print(
+                        f"[MCP-TASK] {session_id} SSE_FAILED error={type(sse_error).__name__}: {sse_error} {elapsed_ms()}"
+                    )
                     if streamable_error:
                         await logger.aerror(
                             f"Both Streamable HTTP and SSE failed for session {session_id}. "
