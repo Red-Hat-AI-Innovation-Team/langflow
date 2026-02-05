@@ -794,7 +794,7 @@ class MCPSessionManager:
 
         # Wait for session to be ready (use longer timeout for remote connections)
         try:
-            session = await asyncio.wait_for(session_future, timeout=30.0)
+            session = await asyncio.wait_for(session_future, timeout=50.0)
         except asyncio.TimeoutError as timeout_err:
             # Clean up the failed task
             if not task.done():
@@ -865,7 +865,7 @@ class MCPSessionManager:
                         session = ClientSession(read, write)
                         async with session:
                             # Initialize with a timeout to fail fast
-                            await asyncio.wait_for(session.initialize(), timeout=2.0)
+                            await asyncio.wait_for(session.initialize(), timeout=5.0)
                             used_transport.append("streamable_http")
                             await logger.ainfo(f"Session {session_id} connected via Streamable HTTP")
                             # Signal that session is ready
@@ -946,7 +946,7 @@ class MCPSessionManager:
 
         # Wait for session to be ready (use longer timeout for remote connections)
         try:
-            session = await asyncio.wait_for(session_future, timeout=30.0)
+            session = await asyncio.wait_for(session_future, timeout=50.0)
             # Log which transport was used
             if used_transport:
                 transport_used = used_transport[0]
