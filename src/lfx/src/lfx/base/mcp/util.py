@@ -993,6 +993,11 @@ class MCPSessionManager:
                             except asyncio.CancelledError:
                                 print(f"[MCP-TASK] {session_id} CANCELLED {elapsed_ms()}")
                                 await logger.ainfo(f"Session {session_id} (Streamable HTTP) is shutting down")
+                                raise  # Re-raise to properly exit context managers
+                except asyncio.CancelledError:
+                    # Session was cancelled - this is expected during cleanup, don't fall back to SSE
+                    print(f"[MCP-TASK] {session_id} STREAMABLE_HTTP_CANCELLED_CLEAN {elapsed_ms()}")
+                    return
                 except (asyncio.TimeoutError, Exception) as e:  # noqa: BLE001
                     # If Streamable HTTP fails or times out, try SSE as fallback immediately
                     streamable_error = e
@@ -1046,6 +1051,11 @@ class MCPSessionManager:
                             except asyncio.CancelledError:
                                 print(f"[MCP-TASK] {session_id} SSE_CANCELLED {elapsed_ms()}")
                                 await logger.ainfo(f"Session {session_id} (SSE) is shutting down")
+                                raise  # Re-raise to properly exit context managers
+                except asyncio.CancelledError:
+                    # Session was cancelled - this is expected during cleanup
+                    print(f"[MCP-TASK] {session_id} SSE_CANCELLED_CLEAN {elapsed_ms()}")
+                    return
                 except Exception as sse_error:  # noqa: BLE001
                     # Both transports failed (or just SSE if it was preferred)
                     print(
