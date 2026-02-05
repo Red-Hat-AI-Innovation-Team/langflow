@@ -695,7 +695,7 @@ class MCPSessionManager:
                                 f"Session {sid} for server {server_key} failed health check, cleaning up"
                             )
                             self._last_health_check.pop(sid, None)
-                            await self._cleanup_session_by_id(server_key, sid)
+                            await self._cleanup_session_by_id(server_key, sid, already_locked=True)
                             continue
 
                         # Session is valid - mark as in use, register and return
@@ -715,7 +715,7 @@ class MCPSessionManager:
                         # Task is done, clean up
                         await logger.ainfo(f"Session {sid} for server {server_key} task is done, cleaning up")
                         self._last_health_check.pop(sid, None)
-                        await self._cleanup_session_by_id(server_key, sid)
+                        await self._cleanup_session_by_id(server_key, sid, already_locked=True)
 
                 # Count non-pending sessions for capacity check
                 active_sessions = sum(1 for s in sessions.values() if not s.get("pending", False))
@@ -770,9 +770,7 @@ class MCPSessionManager:
                     raise ValueError(msg)
 
                 remaining = wait_timeout - waited
-                print(
-                    f"All {len(sessions)} sessions in use for {server_key}, waiting up to {remaining:.1f}s..."
-                )
+                print(f"All {len(sessions)} sessions in use for {server_key}, waiting up to {remaining:.1f}s...")
                 try:
                     # Wait for notification or timeout (wake up periodically to recheck)
                     await asyncio.wait_for(condition.wait(), timeout=min(remaining, 0.2))
@@ -1066,10 +1064,15 @@ class MCPSessionManager:
             await logger.aerror(msg)
             raise ValueError(msg) from timeout_err
 
-    async def _cleanup_session_by_id(self, server_key: str, session_id: str):
+    async def _cleanup_session_by_id(self, server_key: str, session_id: str, *, already_locked: bool = False):
         """Clean up a specific session by server key and session ID.
 
         After cleanup, notifies any waiters that a session slot is now available.
+
+        Args:
+            server_key: The server key
+            session_id: The session ID to clean up
+            already_locked: If True, caller already holds the condition lock (avoids deadlock)
         """
         if server_key not in self.sessions_by_server:
             return
@@ -1138,7 +1141,7 @@ class MCPSessionManager:
             # Clear health check cache for this session
             self._last_health_check.pop(session_id, None)
             # Notify any waiters that a session slot is now available
-            await self._notify_session_available(server_key)
+            await self._notify_session_available(server_key, already_locked=already_locked)
 
     async def release_session(self, context_id: str):
         """Release a session back to the pool after use.
@@ -1184,15 +1187,24 @@ class MCPSessionManager:
         # Notify waiters that a session is available
         await self._notify_session_available(server_key)
 
-    async def _notify_session_available(self, server_key: str):
-        """Notify waiters that a session slot may be available."""
+    async def _notify_session_available(self, server_key: str, *, already_locked: bool = False):
+        """Notify waiters that a session slot may be available.
+
+        Args:
+            server_key: The server key to notify for
+            already_locked: If True, caller already holds the condition lock (avoids deadlock)
+        """
         import sys
 
         condition = self._session_available.get(server_key)
         if condition:
             print(f"[MCP-NOTIFY] notify_all key={server_key[:40]}", file=sys.stderr, flush=True)
-            async with condition:
-                condition.notify_all()  # Wake ALL waiters, not just one
+            if already_locked:
+                # Caller already holds the lock, just notify
+                condition.notify_all()
+            else:
+                async with condition:
+                    condition.notify_all()  # Wake ALL waiters, not just one
 
     async def cleanup_all(self):
         """Clean up all sessions."""
