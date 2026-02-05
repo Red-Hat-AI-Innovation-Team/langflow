@@ -99,10 +99,9 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     # MCP Session-manager tuning
     # ---------------------------------------------------------------------
-    mcp_max_sessions_per_server: int = 20
+    mcp_max_sessions_per_server: int = 200
     """Maximum number of MCP sessions to keep per unique server (command/url).
-    Set to 20 based on stress testing - higher values don't improve throughput
-    and waste server resources. Requests queue when at capacity."""
+    Requests queue when at capacity."""
 
     mcp_session_wait_timeout: int = 30  # seconds
     """Maximum time (in seconds) to wait for a session to become available
