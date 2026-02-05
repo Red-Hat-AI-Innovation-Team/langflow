@@ -775,7 +775,7 @@ class MCPSessionManager:
                 )
                 try:
                     # Wait for notification or timeout (wake up periodically to recheck)
-                    await asyncio.wait_for(condition.wait(), timeout=min(remaining, 1.0))
+                    await asyncio.wait_for(condition.wait(), timeout=min(remaining, 0.2))
                 except asyncio.TimeoutError:
                     # Continue loop to retry or check wait timeout
                     pass
