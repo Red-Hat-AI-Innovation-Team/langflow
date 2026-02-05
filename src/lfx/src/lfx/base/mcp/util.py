@@ -793,9 +793,8 @@ class MCPSessionManager:
         task.add_done_callback(self._background_tasks.discard)
 
         # Wait for session to be ready (use longer timeout for remote connections)
-        # 150s timeout allows for session wait queue (120s) plus connection time
         try:
-            session = await asyncio.wait_for(session_future, timeout=150.0)
+            session = await asyncio.wait_for(session_future, timeout=30.0)
         except asyncio.TimeoutError as timeout_err:
             # Clean up the failed task
             if not task.done():
@@ -946,9 +945,8 @@ class MCPSessionManager:
         task.add_done_callback(self._background_tasks.discard)
 
         # Wait for session to be ready (use longer timeout for remote connections)
-        # 150s timeout allows for session wait queue (120s) plus connection time
         try:
-            session = await asyncio.wait_for(session_future, timeout=150.0)
+            session = await asyncio.wait_for(session_future, timeout=30.0)
             # Log which transport was used
             if used_transport:
                 transport_used = used_transport[0]
