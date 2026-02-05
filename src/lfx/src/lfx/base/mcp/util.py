@@ -1182,10 +1182,21 @@ class MCPStdioClient:
             self._session_context = f"default_{param_hash}"
 
         # Get or create a persistent session
+        # We only need the session briefly to list tools, then release it back to the pool
         session = await self._get_or_create_session()
-        response = await session.list_tools()
-        self._connected = True
-        return response.tools
+        try:
+            response = await session.list_tools()
+            self._connected = True
+            return response.tools
+        finally:
+            # Release session back to pool - we only needed it for list_tools()
+            # This prevents session leaks when connect_to_server is called without run_tool
+            if self._session_context:
+                try:
+                    session_manager = self._get_session_manager()
+                    await session_manager.release_session(self._session_context)
+                except Exception:  # noqa: BLE001
+                    pass  # Best effort release
 
     async def connect_to_server(self, command_str: str, env: dict[str, str] | None = None) -> list[StructuredTool]:
         """Connect to MCP server using stdio transport (SDK style)."""
@@ -1447,10 +1458,21 @@ class MCPStreamableHttpClient:
             self._session_context = f"default_http_{param_hash}"
 
         # Get or create a persistent session (will try Streamable HTTP, then SSE fallback)
+        # We only need the session briefly to list tools, then release it back to the pool
         session = await self._get_or_create_session()
-        response = await session.list_tools()
-        self._connected = True
-        return response.tools
+        try:
+            response = await session.list_tools()
+            self._connected = True
+            return response.tools
+        finally:
+            # Release session back to pool - we only needed it for list_tools()
+            # This prevents session leaks when connect_to_server is called without run_tool
+            if self._session_context:
+                try:
+                    session_manager = self._get_session_manager()
+                    await session_manager.release_session(self._session_context)
+                except Exception:  # noqa: BLE001
+                    pass  # Best effort release
 
     async def connect_to_server(
         self,
