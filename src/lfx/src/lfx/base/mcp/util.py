@@ -642,6 +642,11 @@ class MCPSessionManager:
 
         condition = self._session_available[server_key]
 
+        # Variables for session creation outside lock
+        need_new_session = False
+        session_id: str | None = None
+        preferred_transport: str | None = None
+
         # All session operations now inside condition (which wraps the lock)
         print(f"[MCP-GS] LOCK_WAIT ctx={context_id[:20]}", file=sys.stderr, flush=True)
         async with condition:
@@ -656,12 +661,16 @@ class MCPSessionManager:
                 current_time = asyncio.get_event_loop().time()
 
                 # Try to find a healthy existing session that is not in use
-                for session_id, session_info in list(sessions.items()):
+                for sid, session_info in list(sessions.items()):
+                    # Skip pending sessions (being created by another request)
+                    if session_info.get("pending", False):
+                        continue
+
                     session = session_info["session"]
                     task = session_info["task"]
 
                     # Check if session is still alive
-                    if not task.done():
+                    if task is not None and not task.done():
                         # Skip if session is currently in use by another request
                         if session_info.get("in_use", False):
                             continue
@@ -670,55 +679,80 @@ class MCPSessionManager:
                         session_info["last_used"] = current_time
 
                         # Skip health check if session was recently validated (within grace period)
-                        last_check = self._last_health_check.get(session_id, 0)
+                        last_check = self._last_health_check.get(sid, 0)
                         skip_health_check = current_time - last_check < self.HEALTH_CHECK_GRACE_PERIOD
 
                         if skip_health_check:
                             await logger.adebug(
-                                f"Reusing session {session_id} (skipped health check, last check {current_time - last_check:.1f}s ago)"
+                                f"Reusing session {sid} (skipped health check, last check {current_time - last_check:.1f}s ago)"
                             )
                         elif await self._validate_session_connectivity(session):
-                            await logger.adebug(f"Reusing existing session {session_id} for server {server_key}")
-                            self._last_health_check[session_id] = current_time
+                            await logger.adebug(f"Reusing existing session {sid} for server {server_key}")
+                            self._last_health_check[sid] = current_time
                         else:
                             # Health check failed - clean up and continue to next session
                             await logger.ainfo(
-                                f"Session {session_id} for server {server_key} failed health check, cleaning up"
+                                f"Session {sid} for server {server_key} failed health check, cleaning up"
                             )
-                            self._last_health_check.pop(session_id, None)
-                            await self._cleanup_session_by_id(server_key, session_id)
+                            self._last_health_check.pop(sid, None)
+                            await self._cleanup_session_by_id(server_key, sid)
                             continue
 
                         # Session is valid - mark as in use, register and return
                         session_info["in_use"] = True
-                        self._context_to_session[context_id] = (server_key, session_id)
-                        self._session_refcount[(server_key, session_id)] = (
-                            self._session_refcount.get((server_key, session_id), 0) + 1
-                        )
+                        self._context_to_session[context_id] = (server_key, sid)
+                        self._session_refcount[(server_key, sid)] = self._session_refcount.get((server_key, sid), 0) + 1
                         print(
-                            f"[MCP-GS] REUSE session={session_id} ctx={context_id[:20]} {(time.perf_counter() - t0) * 1000:.0f}ms",
+                            f"[MCP-GS] REUSE session={sid} ctx={context_id[:20]} {(time.perf_counter() - t0) * 1000:.0f}ms",
                             file=sys.stderr,
                             flush=True,
                         )
                         await logger.awarning(
-                            f"[GS] REUSING session {session_id} after {(time.perf_counter() - t0) * 1000:.1f}ms"
+                            f"[GS] REUSING session {sid} after {(time.perf_counter() - t0) * 1000:.1f}ms"
                         )
                         return session
-                    else:
+                    elif task is not None:
                         # Task is done, clean up
-                        await logger.ainfo(f"Session {session_id} for server {server_key} task is done, cleaning up")
-                        self._last_health_check.pop(session_id, None)
-                        await self._cleanup_session_by_id(server_key, session_id)
+                        await logger.ainfo(f"Session {sid} for server {server_key} task is done, cleaning up")
+                        self._last_health_check.pop(sid, None)
+                        await self._cleanup_session_by_id(server_key, sid)
 
-                # Can we create a new session?
+                # Count non-pending sessions for capacity check
+                active_sessions = sum(1 for s in sessions.values() if not s.get("pending", False))
+                pending_sessions = sum(1 for s in sessions.values() if s.get("pending", False))
+
+                # Can we create a new session? (Check against max, considering pending slots)
                 if len(sessions) < get_max_sessions_per_server():
-                    # Yes, break out to create a new session
-                    break
+                    # Reserve a slot for new session
+                    session_id = f"{server_key}_{len(sessions)}"
+                    print(
+                        f"[MCP-GS] NEW session={session_id} ctx={context_id[:20]} {(time.perf_counter() - t0) * 1000:.0f}ms",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    await logger.awarning(
+                        f"[GS] CREATING new session {session_id} after {(time.perf_counter() - t0) * 1000:.1f}ms"
+                    )
+
+                    # Add a placeholder to reserve the slot (prevents other requests from exceeding max)
+                    sessions[session_id] = {
+                        "session": None,
+                        "task": None,
+                        "type": transport_type,
+                        "last_used": asyncio.get_event_loop().time(),
+                        "in_use": True,  # Reserved
+                        "pending": True,  # Indicates creation in progress
+                    }
+                    preferred_transport = (
+                        self._transport_preference.get(server_key) if transport_type == "streamable_http" else None
+                    )
+                    need_new_session = True
+                    break  # Exit while loop to create session outside lock
 
                 # At max capacity and all sessions in use - wait for one to become available
                 in_use_count = sum(1 for s in sessions.values() if s.get("in_use", False))
                 print(
-                    f"[MCP-GS] WAIT ctx={context_id[:20]} pool={len(sessions)}/{get_max_sessions_per_server()} in_use={in_use_count}",
+                    f"[MCP-GS] WAIT ctx={context_id[:20]} pool={len(sessions)}/{get_max_sessions_per_server()} in_use={in_use_count} pending={pending_sessions}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -745,50 +779,76 @@ class MCPSessionManager:
                 except asyncio.TimeoutError:
                     # Continue loop to retry or check wait timeout
                     pass
+        # Lock is released here
 
-            # Create new session
-            session_id = f"{server_key}_{len(sessions)}"
-            print(
-                f"[MCP-GS] NEW session={session_id} ctx={context_id[:20]} {(time.perf_counter() - t0) * 1000:.0f}ms",
-                file=sys.stderr,
-                flush=True,
-            )
-            await logger.awarning(
-                f"[GS] CREATING new session {session_id} after {(time.perf_counter() - t0) * 1000:.1f}ms"
-            )
+        # Create session OUTSIDE the lock to avoid blocking other requests
+        if need_new_session and session_id is not None:
+            print(f"[MCP-GS] CREATING_UNLOCKED session={session_id} ctx={context_id[:20]}", file=sys.stderr, flush=True)
+            try:
+                if transport_type == "stdio":
+                    session, task = await self._create_stdio_session(session_id, connection_params)
+                    actual_transport = "stdio"
+                elif transport_type == "streamable_http":
+                    session, task, actual_transport = await self._create_streamable_http_session(
+                        session_id, connection_params, preferred_transport
+                    )
+                else:
+                    msg = f"Unknown transport type: {transport_type}"
+                    raise ValueError(msg)
 
-            if transport_type == "stdio":
-                session, task = await self._create_stdio_session(session_id, connection_params)
-                actual_transport = "stdio"
-            elif transport_type == "streamable_http":
-                # Pass the cached transport preference if available
-                preferred_transport = self._transport_preference.get(server_key)
-                session, task, actual_transport = await self._create_streamable_http_session(
-                    session_id, connection_params, preferred_transport
+                # Re-acquire lock to register the session
+                async with condition:
+                    server_data = self.sessions_by_server[server_key]
+                    sessions = server_data["sessions"]
+
+                    # Update the placeholder with real session data
+                    sessions[session_id] = {
+                        "session": session,
+                        "task": task,
+                        "type": actual_transport,
+                        "last_used": asyncio.get_event_loop().time(),
+                        "in_use": True,
+                    }
+                    # Cache the transport that worked for future connections
+                    if transport_type == "streamable_http":
+                        self._transport_preference[server_key] = actual_transport
+
+                    # Record initial health check time for the new session
+                    self._last_health_check[session_id] = asyncio.get_event_loop().time()
+
+                    # register mapping & initial ref-count for the new session
+                    self._context_to_session[context_id] = (server_key, session_id)
+                    self._session_refcount[(server_key, session_id)] = 1
+
+                print(
+                    f"[MCP-GS] NEW_DONE session={session_id} ctx={context_id[:20]} {(time.perf_counter() - t0) * 1000:.0f}ms",
+                    file=sys.stderr,
+                    flush=True,
                 )
-                # Cache the transport that worked for future connections
-                self._transport_preference[server_key] = actual_transport
-            else:
-                msg = f"Unknown transport type: {transport_type}"
-                raise ValueError(msg)
+                await logger.ainfo(
+                    f"[GS] NEW session {session_id} ready after {(time.perf_counter() - t0) * 1000:.1f}ms"
+                )
+                return session
 
-            # Store session info with the actual transport used
-            sessions[session_id] = {
-                "session": session,
-                "task": task,
-                "type": actual_transport,
-                "last_used": asyncio.get_event_loop().time(),
-                "in_use": True,  # New session is immediately in use
-            }
-            # Record initial health check time for the new session
-            self._last_health_check[session_id] = asyncio.get_event_loop().time()
+            except Exception as e:
+                # Creation failed - remove the placeholder and notify waiters
+                print(
+                    f"[MCP-GS] CREATE_FAILED session={session_id} ctx={context_id[:20]} error={e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                async with condition:
+                    server_data = self.sessions_by_server[server_key]
+                    sessions = server_data["sessions"]
+                    sessions.pop(session_id, None)
+                    self._last_health_check.pop(session_id, None)
+                    # Notify waiters that a slot is now available
+                    condition.notify_all()
+                raise
 
-            # register mapping & initial ref-count for the new session
-            self._context_to_session[context_id] = (server_key, session_id)
-            self._session_refcount[(server_key, session_id)] = 1
-
-            await logger.ainfo(f"[GS] NEW session {session_id} ready after {(time.perf_counter() - t0) * 1000:.1f}ms")
-            return session
+        # This should not be reached - defensive error
+        msg = f"get_session logic error: need_new_session={need_new_session}, session_id={session_id}"
+        raise ValueError(msg)
 
     async def _create_stdio_session(self, session_id: str, connection_params):
         """Create a new stdio session as a background task to avoid context issues."""
