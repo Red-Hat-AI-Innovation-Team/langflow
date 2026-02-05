@@ -283,6 +283,11 @@ class MCPToolsComponent(ComponentWithCache):
             return schema_inputs
 
     async def update_tool_list(self, mcp_server_value=None):
+        import time
+
+        t0 = time.perf_counter()
+        await logger.ainfo(f"[UTL] update_tool_list START")
+
         # Accepts mcp_server_value as dict {name, config} or uses self.mcp_server
         mcp_server = mcp_server_value if mcp_server_value is not None else getattr(self, "mcp_server", None)
         server_name = None
@@ -294,6 +299,7 @@ class MCPToolsComponent(ComponentWithCache):
             server_name = mcp_server
         if not server_name:
             self.tools = []
+            await logger.ainfo(f"[UTL] No server_name, returning empty after {(time.perf_counter() - t0) * 1000:.1f}ms")
             return [], {"name": server_name, "config": server_config_from_value}
 
         # Check if caching is enabled, default to False
@@ -337,6 +343,9 @@ class MCPToolsComponent(ComponentWithCache):
                 raise ImportError(msg) from e
 
             server_config_from_db = None
+            await logger.ainfo(
+                f"[UTL] Fetching config from DB for {server_name} at {(time.perf_counter() - t0) * 1000:.1f}ms"
+            )
             async with session_scope() as db:
                 if not self.user_id:
                     msg = "User ID is required for fetching MCP tools."
@@ -351,6 +360,7 @@ class MCPToolsComponent(ComponentWithCache):
                     storage_service=get_storage_service(),
                     settings_service=get_settings_service(),
                 )
+            await logger.ainfo(f"[UTL] DB fetch done at {(time.perf_counter() - t0) * 1000:.1f}ms")
 
             # Resolve config with proper precedence: DB takes priority, falls back to value
             server_config = resolve_mcp_config(
@@ -405,13 +415,22 @@ class MCPToolsComponent(ComponentWithCache):
                     await logger.awarning("OAuth enabled but server is not HTTP-based, skipping header injection")
 
             try:
+                await logger.ainfo(
+                    f"[UTL] Calling update_tools for {server_name} at {(time.perf_counter() - t0) * 1000:.1f}ms, url={server_config.get('url', 'N/A')}"
+                )
                 _, tool_list, tool_cache = await update_tools(
                     server_name=server_name,
                     server_config=server_config,
                     mcp_stdio_client=self.stdio_client,
                     mcp_streamable_http_client=self.streamable_http_client,
                 )
+                await logger.ainfo(
+                    f"[UTL] update_tools returned {len(tool_list)} tools at {(time.perf_counter() - t0) * 1000:.1f}ms"
+                )
             except Exception as tool_error:
+                await logger.aerror(
+                    f"[UTL] update_tools FAILED at {(time.perf_counter() - t0) * 1000:.1f}ms: {type(tool_error).__name__}: {tool_error}"
+                )
                 # Extract sub-exceptions from TaskGroup/ExceptionGroup errors
                 actual_errors = []
                 if hasattr(tool_error, "exceptions"):

@@ -618,6 +618,11 @@ class MCPSessionManager:
         wait for a session to become available rather than immediately evicting
         or failing. This prevents connection errors under high concurrency.
         """
+        import time
+
+        t0 = time.perf_counter()
+        await logger.ainfo(f"[GS] get_session START context={context_id} transport={transport_type}")
+
         server_key = self._get_server_key(connection_params, transport_type)
         wait_timeout = get_session_wait_timeout()
         wait_start = asyncio.get_event_loop().time()
@@ -682,6 +687,9 @@ class MCPSessionManager:
                         self._session_refcount[(server_key, session_id)] = (
                             self._session_refcount.get((server_key, session_id), 0) + 1
                         )
+                        await logger.ainfo(
+                            f"[GS] REUSING session {session_id} after {(time.perf_counter() - t0) * 1000:.1f}ms"
+                        )
                         return session
                     else:
                         # Task is done, clean up
@@ -722,7 +730,9 @@ class MCPSessionManager:
 
             # Create new session
             session_id = f"{server_key}_{len(sessions)}"
-            await logger.ainfo(f"Creating new session {session_id} for server {server_key}")
+            await logger.ainfo(
+                f"[GS] CREATING new session {session_id} after {(time.perf_counter() - t0) * 1000:.1f}ms"
+            )
 
             if transport_type == "stdio":
                 session, task = await self._create_stdio_session(session_id, connection_params)
@@ -754,6 +764,7 @@ class MCPSessionManager:
             self._context_to_session[context_id] = (server_key, session_id)
             self._session_refcount[(server_key, session_id)] = 1
 
+            await logger.ainfo(f"[GS] NEW session {session_id} ready after {(time.perf_counter() - t0) * 1000:.1f}ms")
             return session
 
     async def _create_stdio_session(self, session_id: str, connection_params):
@@ -1492,12 +1503,35 @@ class MCPStreamableHttpClient:
         verify_ssl: bool = True,
     ) -> list[StructuredTool]:
         """Connect to MCP server using Streamable HTTP with SSE fallback transport (SDK style)."""
-        return await asyncio.wait_for(
-            self._connect_to_server(
-                url, headers, sse_read_timeout_seconds=sse_read_timeout_seconds, verify_ssl=verify_ssl
-            ),
-            timeout=get_settings_service().settings.mcp_server_timeout,
+        import time
+
+        t0 = time.perf_counter()
+        timeout_val = get_settings_service().settings.mcp_server_timeout
+        await logger.ainfo(
+            f"[CTS] connect_to_server START url={url} timeout={timeout_val}s context={self._session_context}"
         )
+        try:
+            result = await asyncio.wait_for(
+                self._connect_to_server(
+                    url, headers, sse_read_timeout_seconds=sse_read_timeout_seconds, verify_ssl=verify_ssl
+                ),
+                timeout=timeout_val,
+            )
+            await logger.ainfo(
+                f"[CTS] connect_to_server SUCCESS after {(time.perf_counter() - t0) * 1000:.1f}ms, got {len(result)} tools"
+            )
+            return result
+        except asyncio.TimeoutError as e:
+            await logger.aerror(f"[CTS] connect_to_server TIMEOUT after {(time.perf_counter() - t0) * 1000:.1f}ms")
+            raise
+        except asyncio.CancelledError as e:
+            await logger.aerror(f"[CTS] connect_to_server CANCELLED after {(time.perf_counter() - t0) * 1000:.1f}ms")
+            raise
+        except Exception as e:
+            await logger.aerror(
+                f"[CTS] connect_to_server FAILED after {(time.perf_counter() - t0) * 1000:.1f}ms: {type(e).__name__}: {e}"
+            )
+            raise
 
     def set_session_context(self, context_id: str):
         """Set the session context (e.g., flow_id + user_id + session_id)."""
