@@ -1303,19 +1303,20 @@ class MCPStdioClient:
             self._session_context = f"default_{param_hash}"
 
         # Get or create a persistent session
-        session = await self._get_or_create_session()
+        session = None
         try:
+            session = await self._get_or_create_session()
             response = await session.list_tools()
             self._connected = True
             return response.tools
         finally:
             # Release session back to pool after listing tools
             # This ensures the session is available for run_tool() or other requests
-            if self._session_context:
+            if self._session_context and session is not None:
                 try:
                     session_manager = self._get_session_manager()
                     await session_manager.release_session(self._session_context)
-                except Exception:  # noqa: BLE001
+                except BaseException:  # noqa: BLE001
                     pass  # Best effort release
 
     async def connect_to_server(self, command_str: str, env: dict[str, str] | None = None) -> list[StructuredTool]:
@@ -1579,18 +1580,10 @@ class MCPStreamableHttpClient:
             response = await session.list_tools()
             self._connected = True
             return response.tools
-        except BaseException:
-            # On any error (including CancelledError), ensure session is released
+        finally:
+            # Always release session back to pool - runs on success, exception, AND return
+            # The else block was unreachable because try ends with return statement
             if self._session_context and session is not None:
-                try:
-                    session_manager = self._get_session_manager()
-                    await session_manager.release_session(self._session_context)
-                except BaseException:  # noqa: BLE001
-                    pass  # Best effort release
-            raise
-        else:
-            # Success path - also release the session
-            if self._session_context:
                 try:
                     session_manager = self._get_session_manager()
                     await session_manager.release_session(self._session_context)
