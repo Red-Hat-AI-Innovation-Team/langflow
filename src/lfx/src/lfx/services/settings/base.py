@@ -99,14 +99,19 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     # MCP Session-manager tuning
     # ---------------------------------------------------------------------
-    mcp_max_sessions_per_server: int = 50
+    mcp_max_sessions_per_server: int = 20
     """Maximum number of MCP sessions to keep per unique server (command/url).
-    Increased from 10 to 50 to support high-concurrency evaluation scenarios.
-    Adjust to control resource usage or concurrency per server."""
+    Set to 20 based on stress testing - higher values don't improve throughput
+    and waste server resources. Requests queue when at capacity."""
+
+    mcp_session_wait_timeout: int = 30  # seconds
+    """Maximum time (in seconds) to wait for a session to become available
+    when all sessions are in use. Prevents immediate failure under high concurrency
+    by allowing requests to queue and wait for available sessions."""
 
     mcp_session_idle_timeout: int = 400  # seconds
     """How long (in seconds) an MCP session can stay idle before the background
-    cleanup task disposes of it. Defaults to 5 minutes."""
+    cleanup task disposes of it. Defaults to ~7 minutes."""
 
     mcp_session_cleanup_interval: int = 120  # seconds
     """Frequency (in seconds) at which the background cleanup task wakes up to

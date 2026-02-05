@@ -50,17 +50,22 @@ def _get_mcp_setting(key: str, default: Any = None) -> Any:
 
 def get_max_sessions_per_server() -> int:
     """Get maximum number of sessions per server to prevent resource exhaustion."""
-    return _get_mcp_setting("mcp_max_sessions_per_server")
+    return _get_mcp_setting("mcp_max_sessions_per_server", 100)
+
+
+def get_session_wait_timeout() -> int:
+    """Get maximum time to wait for a session when pool is exhausted."""
+    return _get_mcp_setting("mcp_session_wait_timeout", 30)
 
 
 def get_session_idle_timeout() -> int:
-    """Get 5 minutes idle timeout for sessions."""
-    return _get_mcp_setting("mcp_session_idle_timeout")
+    """Get idle timeout for sessions (~7 minutes default)."""
+    return _get_mcp_setting("mcp_session_idle_timeout", 400)
 
 
 def get_session_cleanup_interval() -> int:
     """Get cleanup interval in seconds."""
-    return _get_mcp_setting("mcp_session_cleanup_interval")
+    return _get_mcp_setting("mcp_session_cleanup_interval", 120)
 
 
 # RFC 7230 compliant header name pattern: token = 1*tchar
@@ -465,6 +470,7 @@ class MCPSessionManager:
     3. Idle timeout for automatic session cleanup
     4. Periodic cleanup of stale sessions
     5. Transport preference caching to avoid retrying failed transports
+    6. Wait/queue mechanism when sessions are exhausted (prevents immediate failure)
     """
 
     # Skip health check if session was validated within this many seconds
@@ -488,6 +494,8 @@ class MCPSessionManager:
         self._cleanup_task = None
         # Track last successful health check time per session to avoid redundant checks
         self._last_health_check: dict[str, float] = {}
+        # Condition variables for waiting when sessions are exhausted (per server)
+        self._session_available: dict[str, asyncio.Condition] = {}
         self._start_cleanup_task()
 
     def _start_cleanup_task(self):
@@ -605,75 +613,112 @@ class MCPSessionManager:
         The key insight is that we should reuse sessions based on the server
         identity (command + args for stdio, URL for Streamable HTTP) rather than the context_id.
         This prevents creating a new subprocess for each unique context.
+
+        When all sessions are in use and we're at max capacity, this method will
+        wait for a session to become available rather than immediately evicting
+        or failing. This prevents connection errors under high concurrency.
         """
         server_key = self._get_server_key(connection_params, transport_type)
+        wait_timeout = get_session_wait_timeout()
+        wait_start = asyncio.get_event_loop().time()
 
-        # Ensure server entry exists
+        # Ensure server entry and condition variable exist
         if server_key not in self.sessions_by_server:
             self.sessions_by_server[server_key] = {"sessions": {}, "last_cleanup": asyncio.get_event_loop().time()}
 
-        server_data = self.sessions_by_server[server_key]
-        sessions = server_data["sessions"]
-
-        # Get or create lock for this server (prevents race condition)
+        # Get or create lock and condition for this server
         async with self._lock_lock:
             if server_key not in self._server_locks:
                 self._server_locks[server_key] = asyncio.Lock()
+            if server_key not in self._session_available:
+                self._session_available[server_key] = asyncio.Condition(self._server_locks[server_key])
 
-        # All session operations now inside lock - atomic
-        async with self._server_locks[server_key]:
-            current_time = asyncio.get_event_loop().time()
+        condition = self._session_available[server_key]
 
-            # Try to find a healthy existing session
-            for session_id, session_info in list(sessions.items()):
-                session = session_info["session"]
-                task = session_info["task"]
+        # All session operations now inside condition (which wraps the lock)
+        async with condition:
+            while True:
+                server_data = self.sessions_by_server[server_key]
+                sessions = server_data["sessions"]
+                current_time = asyncio.get_event_loop().time()
 
-                # Check if session is still alive
-                if not task.done():
-                    # Update last used time
-                    session_info["last_used"] = current_time
+                # Try to find a healthy existing session that is not in use
+                for session_id, session_info in list(sessions.items()):
+                    session = session_info["session"]
+                    task = session_info["task"]
 
-                    # Skip health check if session was recently validated (within grace period)
-                    last_check = self._last_health_check.get(session_id, 0)
-                    skip_health_check = current_time - last_check < self.HEALTH_CHECK_GRACE_PERIOD
+                    # Check if session is still alive
+                    if not task.done():
+                        # Skip if session is currently in use by another request
+                        if session_info.get("in_use", False):
+                            continue
 
-                    if skip_health_check:
-                        await logger.adebug(
-                            f"Reusing session {session_id} (skipped health check, last check {current_time - last_check:.1f}s ago)"
+                        # Update last used time
+                        session_info["last_used"] = current_time
+
+                        # Skip health check if session was recently validated (within grace period)
+                        last_check = self._last_health_check.get(session_id, 0)
+                        skip_health_check = current_time - last_check < self.HEALTH_CHECK_GRACE_PERIOD
+
+                        if skip_health_check:
+                            await logger.adebug(
+                                f"Reusing session {session_id} (skipped health check, last check {current_time - last_check:.1f}s ago)"
+                            )
+                        elif await self._validate_session_connectivity(session):
+                            await logger.adebug(f"Reusing existing session {session_id} for server {server_key}")
+                            self._last_health_check[session_id] = current_time
+                        else:
+                            # Health check failed - clean up and continue to next session
+                            await logger.ainfo(
+                                f"Session {session_id} for server {server_key} failed health check, cleaning up"
+                            )
+                            self._last_health_check.pop(session_id, None)
+                            await self._cleanup_session_by_id(server_key, session_id)
+                            continue
+
+                        # Session is valid - mark as in use, register and return
+                        session_info["in_use"] = True
+                        self._context_to_session[context_id] = (server_key, session_id)
+                        self._session_refcount[(server_key, session_id)] = (
+                            self._session_refcount.get((server_key, session_id), 0) + 1
                         )
-                    elif await self._validate_session_connectivity(session):
-                        await logger.adebug(f"Reusing existing session {session_id} for server {server_key}")
-                        self._last_health_check[session_id] = current_time
+                        return session
                     else:
-                        # Health check failed - clean up and continue to next session
-                        await logger.ainfo(
-                            f"Session {session_id} for server {server_key} failed health check, cleaning up"
-                        )
+                        # Task is done, clean up
+                        await logger.ainfo(f"Session {session_id} for server {server_key} task is done, cleaning up")
                         self._last_health_check.pop(session_id, None)
                         await self._cleanup_session_by_id(server_key, session_id)
-                        continue
 
-                    # Session is valid - register and return
-                    self._context_to_session[context_id] = (server_key, session_id)
-                    self._session_refcount[(server_key, session_id)] = (
-                        self._session_refcount.get((server_key, session_id), 0) + 1
-                    )
-                    return session
-                else:
-                    # Task is done, clean up
-                    await logger.ainfo(f"Session {session_id} for server {server_key} task is done, cleaning up")
-                    self._last_health_check.pop(session_id, None)
-                    await self._cleanup_session_by_id(server_key, session_id)
+                # Can we create a new session?
+                if len(sessions) < get_max_sessions_per_server():
+                    # Yes, break out to create a new session
+                    break
 
-            # Check if we've reached the maximum number of sessions for this server
-            if len(sessions) >= get_max_sessions_per_server():
-                # Remove the oldest session
-                oldest_session_id = min(sessions.keys(), key=lambda x: sessions[x]["last_used"])
-                await logger.ainfo(
-                    f"Maximum sessions reached for server {server_key}, removing oldest session {oldest_session_id}"
+                # At max capacity and all sessions in use - wait for one to become available
+                in_use_count = sum(1 for s in sessions.values() if s.get("in_use", False))
+                await logger.adebug(
+                    f"Sessions: {len(sessions)}/{get_max_sessions_per_server()}, in_use: {in_use_count}"
                 )
-                await self._cleanup_session_by_id(server_key, oldest_session_id)
+
+                waited = current_time - wait_start
+                if waited >= wait_timeout:
+                    msg = (
+                        f"Timeout waiting for MCP session after {waited:.1f}s "
+                        f"(server: {server_key}, sessions: {len(sessions)}/{get_max_sessions_per_server()})"
+                    )
+                    await logger.aerror(msg)
+                    raise ValueError(msg)
+
+                remaining = wait_timeout - waited
+                await logger.adebug(
+                    f"All {len(sessions)} sessions in use for {server_key}, waiting up to {remaining:.1f}s..."
+                )
+                try:
+                    # Wait for notification or timeout (wake up periodically to recheck)
+                    await asyncio.wait_for(condition.wait(), timeout=min(remaining, 1.0))
+                except asyncio.TimeoutError:
+                    # Continue loop to retry or check wait timeout
+                    pass
 
             # Create new session
             session_id = f"{server_key}_{len(sessions)}"
@@ -700,6 +745,7 @@ class MCPSessionManager:
                 "task": task,
                 "type": actual_transport,
                 "last_used": asyncio.get_event_loop().time(),
+                "in_use": True,  # New session is immediately in use
             }
             # Record initial health check time for the new session
             self._last_health_check[session_id] = asyncio.get_event_loop().time()
@@ -923,7 +969,10 @@ class MCPSessionManager:
             raise ValueError(msg) from timeout_err
 
     async def _cleanup_session_by_id(self, server_key: str, session_id: str):
-        """Clean up a specific session by server key and session ID."""
+        """Clean up a specific session by server key and session ID.
+
+        After cleanup, notifies any waiters that a session slot is now available.
+        """
         if server_key not in self.sessions_by_server:
             return
 
@@ -990,6 +1039,39 @@ class MCPSessionManager:
             sessions.pop(session_id, None)
             # Clear health check cache for this session
             self._last_health_check.pop(session_id, None)
+            # Notify any waiters that a session slot is now available
+            await self._notify_session_available(server_key)
+
+    async def release_session(self, context_id: str):
+        """Release a session back to the pool after use.
+
+        Marks the session as no longer in use, allowing other requests to use it.
+        Call this when done with a session obtained from get_session().
+        """
+        mapping = self._context_to_session.get(context_id)
+        if not mapping:
+            await logger.adebug(f"No session mapping found for context_id {context_id} during release")
+            return
+
+        server_key, session_id = mapping
+
+        # Find and release the session
+        if server_key in self.sessions_by_server:
+            server_data = self.sessions_by_server[server_key]
+            sessions = server_data.get("sessions", {})
+            if session_id in sessions:
+                sessions[session_id]["in_use"] = False
+                await logger.adebug(f"Released session {session_id} for server {server_key}")
+
+        # Notify waiters that a session is available
+        await self._notify_session_available(server_key)
+
+    async def _notify_session_available(self, server_key: str):
+        """Notify waiters that a session slot may be available."""
+        condition = self._session_available.get(server_key)
+        if condition:
+            async with condition:
+                condition.notify()
 
     async def cleanup_all(self):
         """Clean up all sessions."""
@@ -1170,6 +1252,7 @@ class MCPStdioClient:
         last_error_type = None
 
         for attempt in range(max_retries):
+            session = None
             try:
                 await logger.adebug(f"Attempting to run tool '{tool_name}' (attempt {attempt + 1}/{max_retries})")
                 # Get or create persistent session
@@ -1182,6 +1265,14 @@ class MCPStdioClient:
             except Exception as e:
                 current_error_type = type(e).__name__
                 await logger.awarning(f"Tool '{tool_name}' failed on attempt {attempt + 1}: {current_error_type} - {e}")
+
+                # Release session back to pool on error
+                if session is not None and self._session_context:
+                    try:
+                        session_manager = self._get_session_manager()
+                        await session_manager.release_session(self._session_context)
+                    except Exception:  # noqa: BLE001
+                        pass  # Best effort release
 
                 # Import specific MCP error types for detection
                 try:
@@ -1240,6 +1331,13 @@ class MCPStdioClient:
                 raise
             else:
                 await logger.adebug(f"Tool '{tool_name}' completed successfully")
+                # Release session back to pool on success
+                if self._session_context:
+                    try:
+                        session_manager = self._get_session_manager()
+                        await session_manager.release_session(self._session_context)
+                    except Exception:  # noqa: BLE001
+                        pass  # Best effort release
                 return result
 
         # This should never be reached due to the exception handling above
@@ -1442,6 +1540,7 @@ class MCPStreamableHttpClient:
         last_error_type = None
 
         for attempt in range(max_retries):
+            session = None
             try:
                 await logger.adebug(f"Attempting to run tool '{tool_name}' (attempt {attempt + 1}/{max_retries})")
                 # Get or create persistent session
@@ -1454,6 +1553,14 @@ class MCPStreamableHttpClient:
             except Exception as e:
                 current_error_type = type(e).__name__
                 await logger.awarning(f"Tool '{tool_name}' failed on attempt {attempt + 1}: {current_error_type} - {e}")
+
+                # Release session back to pool on error
+                if session is not None and self._session_context:
+                    try:
+                        session_manager = self._get_session_manager()
+                        await session_manager.release_session(self._session_context)
+                    except Exception:  # noqa: BLE001
+                        pass  # Best effort release
 
                 # Import specific MCP error types for detection
                 try:
@@ -1515,6 +1622,13 @@ class MCPStreamableHttpClient:
                 raise
             else:
                 await logger.adebug(f"Tool '{tool_name}' completed successfully")
+                # Release session back to pool on success
+                if self._session_context:
+                    try:
+                        session_manager = self._get_session_manager()
+                        await session_manager.release_session(self._session_context)
+                    except Exception:  # noqa: BLE001
+                        pass  # Best effort release
                 return result
 
         # This should never be reached due to the exception handling above
