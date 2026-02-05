@@ -770,7 +770,7 @@ class MCPSessionManager:
                     raise ValueError(msg)
 
                 remaining = wait_timeout - waited
-                await logger.adebug(
+                print(
                     f"All {len(sessions)} sessions in use for {server_key}, waiting up to {remaining:.1f}s..."
                 )
                 try:
