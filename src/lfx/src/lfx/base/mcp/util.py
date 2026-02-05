@@ -643,7 +643,13 @@ class MCPSessionManager:
         condition = self._session_available[server_key]
 
         # All session operations now inside condition (which wraps the lock)
+        print(f"[MCP-GS] LOCK_WAIT ctx={context_id[:20]}", file=sys.stderr, flush=True)
         async with condition:
+            print(
+                f"[MCP-GS] LOCK_ACQ ctx={context_id[:20]} after {(time.perf_counter() - t0) * 1000:.0f}ms",
+                file=sys.stderr,
+                flush=True,
+            )
             while True:
                 server_data = self.sessions_by_server[server_key]
                 sessions = server_data["sessions"]
