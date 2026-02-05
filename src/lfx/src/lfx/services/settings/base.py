@@ -92,7 +92,7 @@ class Settings(BaseSettings):
     If not provided, a hash of the database URL will be used. Useful when multiple Langflow
     instances share the same database and need coordinated migration locking."""
 
-    mcp_server_timeout: int = 120
+    mcp_server_timeout: int = 150
     """The number of seconds to wait before giving up on establishing a connection to the
     MCP server. Increased from 20s to handle high-concurrency scenarios."""
 
