@@ -496,6 +496,8 @@ class MCPSessionManager:
         self._last_health_check: dict[str, float] = {}
         # Condition variables for waiting when sessions are exhausted (per server)
         self._session_available: dict[str, asyncio.Condition] = {}
+        # Incrementing counter for unique session IDs per server (never decreases)
+        self._session_counter: dict[str, int] = {}
         self._start_cleanup_task()
 
     def _start_cleanup_task(self):
@@ -723,8 +725,10 @@ class MCPSessionManager:
 
                 # Can we create a new session? (Check against max, considering pending slots)
                 if len(sessions) < get_max_sessions_per_server():
-                    # Reserve a slot for new session
-                    session_id = f"{server_key}_{len(sessions)}"
+                    # Reserve a slot for new session using incrementing counter (never collides)
+                    counter = self._session_counter.get(server_key, 0)
+                    session_id = f"{server_key}_{counter}"
+                    self._session_counter[server_key] = counter + 1
                     print(
                         f"[MCP-GS] NEW session={session_id} ctx={context_id[:20]} {(time.perf_counter() - t0) * 1000:.0f}ms",
                         file=sys.stderr,
