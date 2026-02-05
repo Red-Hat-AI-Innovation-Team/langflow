@@ -619,8 +619,10 @@ class MCPSessionManager:
         or failing. This prevents connection errors under high concurrency.
         """
         import time
+        import sys
 
         t0 = time.perf_counter()
+        print(f"[MCP-GS] START context={context_id} transport={transport_type}", file=sys.stderr, flush=True)
         await logger.awarning(f"[GS] get_session START context={context_id} transport={transport_type}")
 
         server_key = self._get_server_key(connection_params, transport_type)
@@ -687,6 +689,11 @@ class MCPSessionManager:
                         self._session_refcount[(server_key, session_id)] = (
                             self._session_refcount.get((server_key, session_id), 0) + 1
                         )
+                        print(
+                            f"[MCP-GS] REUSE session={session_id} ctx={context_id[:20]} {(time.perf_counter() - t0) * 1000:.0f}ms",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         await logger.awarning(
                             f"[GS] REUSING session {session_id} after {(time.perf_counter() - t0) * 1000:.1f}ms"
                         )
@@ -704,6 +711,11 @@ class MCPSessionManager:
 
                 # At max capacity and all sessions in use - wait for one to become available
                 in_use_count = sum(1 for s in sessions.values() if s.get("in_use", False))
+                print(
+                    f"[MCP-GS] WAIT ctx={context_id[:20]} pool={len(sessions)}/{get_max_sessions_per_server()} in_use={in_use_count}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 await logger.awarning(
                     f"[GS] WAITING: sessions={len(sessions)}/{get_max_sessions_per_server()}, in_use={in_use_count}"
                 )
@@ -730,6 +742,11 @@ class MCPSessionManager:
 
             # Create new session
             session_id = f"{server_key}_{len(sessions)}"
+            print(
+                f"[MCP-GS] NEW session={session_id} ctx={context_id[:20]} {(time.perf_counter() - t0) * 1000:.0f}ms",
+                file=sys.stderr,
+                flush=True,
+            )
             await logger.awarning(
                 f"[GS] CREATING new session {session_id} after {(time.perf_counter() - t0) * 1000:.1f}ms"
             )
@@ -1059,8 +1076,11 @@ class MCPSessionManager:
         Decrements the refcount for this context's session and marks it as not in use.
         Call this when done with a session obtained from get_session().
         """
+        import sys
+
         mapping = self._context_to_session.get(context_id)
         if not mapping:
+            print(f"[MCP-REL] NO_MAP ctx={context_id[:30]}", file=sys.stderr, flush=True)
             await logger.adebug(f"No session mapping found for context_id {context_id} during release")
             return
 
@@ -1083,6 +1103,12 @@ class MCPSessionManager:
             sessions = server_data.get("sessions", {})
             if session_id in sessions:
                 sessions[session_id]["in_use"] = False
+                in_use_count = sum(1 for s in sessions.values() if s.get("in_use", False))
+                print(
+                    f"[MCP-REL] OK session={session_id[-15:]} ctx={context_id[:20]} ref={remaining} pool={in_use_count}/{len(sessions)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 await logger.adebug(f"Released session {session_id} for server {server_key} (refcount: {remaining})")
 
         # Notify waiters that a session is available
@@ -1090,10 +1116,13 @@ class MCPSessionManager:
 
     async def _notify_session_available(self, server_key: str):
         """Notify waiters that a session slot may be available."""
+        import sys
+
         condition = self._session_available.get(server_key)
         if condition:
+            print(f"[MCP-NOTIFY] notify_all key={server_key[:40]}", file=sys.stderr, flush=True)
             async with condition:
-                condition.notify()
+                condition.notify_all()  # Wake ALL waiters, not just one
 
     async def cleanup_all(self):
         """Clean up all sessions."""
