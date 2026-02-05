@@ -1002,6 +1002,12 @@ class MCPSessionManager:
                     # If Streamable HTTP fails or times out, try SSE as fallback immediately
                     streamable_error = e
                     error_type = "timed out" if isinstance(e, asyncio.TimeoutError) else "failed"
+                    # Log ExceptionGroup sub-exceptions for debugging
+                    if isinstance(e, ExceptionGroup):
+                        for i, sub_exc in enumerate(e.exceptions):
+                            print(
+                                f"[MCP-TASK] {session_id} STREAMABLE_HTTP_SUBEXC[{i}] {type(sub_exc).__name__}: {sub_exc}"
+                            )
                     print(
                         f"[MCP-TASK] {session_id} STREAMABLE_HTTP_FAILED error={type(e).__name__}: {e} {elapsed_ms()}"
                     )
