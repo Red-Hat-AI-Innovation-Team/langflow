@@ -1397,14 +1397,6 @@ class MCPStdioClient:
                 current_error_type = type(e).__name__
                 await logger.awarning(f"Tool '{tool_name}' failed on attempt {attempt + 1}: {current_error_type} - {e}")
 
-                # Release session back to pool on error
-                if session is not None and self._session_context:
-                    try:
-                        session_manager = self._get_session_manager()
-                        await session_manager.release_session(self._session_context)
-                    except Exception:  # noqa: BLE001
-                        pass  # Best effort release
-
                 # Import specific MCP error types for detection
                 try:
                     is_closed_resource_error = isinstance(e, ClosedResourceError)
@@ -1462,14 +1454,17 @@ class MCPStdioClient:
                 raise
             else:
                 await logger.adebug(f"Tool '{tool_name}' completed successfully")
-                # Release session back to pool on success
+                return result
+            finally:
+                # Always release session back to pool - handles success, Exception, AND CancelledError
+                # CancelledError is a BaseException (not Exception), so it bypasses except blocks
+                # but finally always runs, preventing session leaks on task cancellation
                 if self._session_context:
                     try:
                         session_manager = self._get_session_manager()
                         await session_manager.release_session(self._session_context)
                     except Exception:  # noqa: BLE001
                         pass  # Best effort release
-                return result
 
         # This should never be reached due to the exception handling above
         msg = f"Failed to run tool '{tool_name}': Maximum retries exceeded with repeated {last_error_type} errors"
@@ -1727,14 +1722,6 @@ class MCPStreamableHttpClient:
                 current_error_type = type(e).__name__
                 await logger.awarning(f"Tool '{tool_name}' failed on attempt {attempt + 1}: {current_error_type} - {e}")
 
-                # Release session back to pool on error
-                if session is not None and self._session_context:
-                    try:
-                        session_manager = self._get_session_manager()
-                        await session_manager.release_session(self._session_context)
-                    except Exception:  # noqa: BLE001
-                        pass  # Best effort release
-
                 # Import specific MCP error types for detection
                 try:
                     from anyio import ClosedResourceError
@@ -1795,14 +1782,17 @@ class MCPStreamableHttpClient:
                 raise
             else:
                 await logger.adebug(f"Tool '{tool_name}' completed successfully")
-                # Release session back to pool on success
+                return result
+            finally:
+                # Always release session back to pool - handles success, Exception, AND CancelledError
+                # CancelledError is a BaseException (not Exception), so it bypasses except blocks
+                # but finally always runs, preventing session leaks on task cancellation
                 if self._session_context:
                     try:
                         session_manager = self._get_session_manager()
                         await session_manager.release_session(self._session_context)
                     except Exception:  # noqa: BLE001
                         pass  # Best effort release
-                return result
 
         # This should never be reached due to the exception handling above
         msg = f"Failed to run tool '{tool_name}': Maximum retries exceeded with repeated {last_error_type} errors"
