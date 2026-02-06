@@ -11,6 +11,27 @@ from typing_extensions import override
 from langflow.serialization.serialization import serialize
 from langflow.services.tracing.base import BaseTracer
 
+# Singleton Langfuse client to prevent FD exhaustion from multiple HTTP connection pools
+_langfuse_client: "Langfuse | None" = None
+_langfuse_client_config_hash: int | None = None
+
+
+def _get_shared_langfuse_client(config: dict) -> "Langfuse":
+    """Get or create shared Langfuse client.
+
+    Uses a singleton pattern to avoid creating multiple HTTP connection pools
+    when running many parallel traces (e.g., during batch evaluations).
+    """
+    global _langfuse_client, _langfuse_client_config_hash
+    from langfuse import Langfuse
+
+    config_hash = hash(frozenset(config.items()))
+    if _langfuse_client is None or _langfuse_client_config_hash != config_hash:
+        _langfuse_client = Langfuse(**config)
+        _langfuse_client_config_hash = config_hash
+    return _langfuse_client
+
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from uuid import UUID
@@ -51,9 +72,7 @@ class LangFuseTracer(BaseTracer):
 
     def setup_langfuse(self, config) -> bool:
         try:
-            from langfuse import Langfuse
-
-            self._client = Langfuse(**config)
+            self._client = _get_shared_langfuse_client(config)
             try:
                 from langfuse.api.core.request_options import RequestOptions
 
@@ -80,7 +99,7 @@ class LangFuseTracer(BaseTracer):
             return False
 
         except Exception as e:  # noqa: BLE001
-            logger.debug(f"Error setting up LangSmith tracer: {e}")
+            logger.debug(f"Error setting up LangFuse tracer: {e}")
             return False
 
         return True

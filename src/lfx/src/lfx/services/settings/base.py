@@ -78,12 +78,12 @@ class Settings(BaseSettings):
     `postgresql+psycopg` respectively)."""
     database_connection_retry: bool = False
     """If True, Langflow will retry to connect to the database if it fails."""
-    pool_size: int = 20
+    pool_size: int = 100
     """The number of connections to keep open in the connection pool.
-    For high load scenarios, this should be increased based on expected concurrent users."""
-    max_overflow: int = 30
+    Increased from 20 to 100 to support high-concurrency evaluation scenarios (100+ concurrent requests)."""
+    max_overflow: int = 150
     """The number of connections to allow that can be opened beyond the pool size.
-    Should be 2x the pool_size for optimal performance under load."""
+    Increased from 30 to 150 to support high-concurrency scenarios. Total max = pool_size + max_overflow = 250."""
     db_connect_timeout: int = 30
     """The number of seconds to wait before giving up on a lock to released or establishing a connection to the
     database."""
@@ -92,36 +92,58 @@ class Settings(BaseSettings):
     If not provided, a hash of the database URL will be used. Useful when multiple Langflow
     instances share the same database and need coordinated migration locking."""
 
-    mcp_server_timeout: int = 20
-    """The number of seconds to wait before giving up on a lock to released or establishing a connection to the
-    database."""
+    mcp_server_timeout: int = 150
+    """The number of seconds to wait before giving up on establishing a connection to the
+    MCP server. Increased from 20s to handle high-concurrency scenarios."""
 
     # ---------------------------------------------------------------------
     # MCP Session-manager tuning
     # ---------------------------------------------------------------------
-    mcp_max_sessions_per_server: int = 10
+    mcp_max_sessions_per_server: int = 200
     """Maximum number of MCP sessions to keep per unique server (command/url).
-    Mirrors the default constant MAX_SESSIONS_PER_SERVER in util.py. Adjust to
-    control resource usage or concurrency per server."""
+    Requests queue when at capacity."""
+
+    mcp_session_wait_timeout: int = 30  # seconds
+    """Maximum time (in seconds) to wait for a session to become available
+    when all sessions are in use. Prevents immediate failure under high concurrency
+    by allowing requests to queue and wait for available sessions."""
 
     mcp_session_idle_timeout: int = 400  # seconds
     """How long (in seconds) an MCP session can stay idle before the background
-    cleanup task disposes of it. Defaults to 5 minutes."""
+    cleanup task disposes of it. Defaults to ~7 minutes."""
 
     mcp_session_cleanup_interval: int = 120  # seconds
     """Frequency (in seconds) at which the background cleanup task wakes up to
     reap idle sessions."""
 
     # sqlite configuration
-    sqlite_pragmas: dict | None = {"synchronous": "NORMAL", "journal_mode": "WAL", "busy_timeout": 30000}
-    """SQLite pragmas to use when connecting to the database."""
+    sqlite_pragmas: dict | None = {
+        "synchronous": "NORMAL",
+        "journal_mode": "WAL",
+        "busy_timeout": 60000,
+        "cache_size": -64000,
+        "temp_store": "MEMORY",
+        "mmap_size": 268435456,
+        "wal_autocheckpoint": 5000,
+    }
+    """SQLite pragmas to use when connecting to the database.
+
+    Optimizations configured:
+    - synchronous: NORMAL (WAL mode - less durable but faster)
+    - journal_mode: WAL (non-blocking readers/writers)
+    - busy_timeout: 60000ms (wait 60s for lock release)
+    - cache_size: -64000KB = 64MB (reduces disk I/O)
+    - temp_store: MEMORY (faster temporary tables)
+    - mmap_size: 268435456 = 256MB (memory-mapped I/O for faster reads/writes)
+    - wal_autocheckpoint: 5000 pages (less frequent checkpoints for bursty writes)
+    """
 
     db_driver_connection_settings: dict | None = None
     """Database driver connection settings."""
 
     db_connection_settings: dict | None = {
-        "pool_size": 20,  # Match the pool_size above
-        "max_overflow": 30,  # Match the max_overflow above
+        "pool_size": 100,  # Increased from 20 for high-concurrency (100+ concurrent requests)
+        "max_overflow": 150,  # Increased from 30. Total max = pool_size + max_overflow = 250
         "pool_timeout": 30,  # Seconds to wait for a connection from pool
         "pool_pre_ping": True,  # Check connection validity before using
         "pool_recycle": 1800,  # Recycle connections after 30 minutes

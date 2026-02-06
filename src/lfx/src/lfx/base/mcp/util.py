@@ -50,17 +50,22 @@ def _get_mcp_setting(key: str, default: Any = None) -> Any:
 
 def get_max_sessions_per_server() -> int:
     """Get maximum number of sessions per server to prevent resource exhaustion."""
-    return _get_mcp_setting("mcp_max_sessions_per_server")
+    return _get_mcp_setting("mcp_max_sessions_per_server", 20)
+
+
+def get_session_wait_timeout() -> int:
+    """Get maximum time to wait for a session when pool is exhausted."""
+    return _get_mcp_setting("mcp_session_wait_timeout", 30)
 
 
 def get_session_idle_timeout() -> int:
-    """Get 5 minutes idle timeout for sessions."""
-    return _get_mcp_setting("mcp_session_idle_timeout")
+    """Get idle timeout for sessions (~7 minutes default)."""
+    return _get_mcp_setting("mcp_session_idle_timeout", 400)
 
 
 def get_session_cleanup_interval() -> int:
     """Get cleanup interval in seconds."""
-    return _get_mcp_setting("mcp_session_cleanup_interval")
+    return _get_mcp_setting("mcp_session_cleanup_interval", 120)
 
 
 # RFC 7230 compliant header name pattern: token = 1*tchar
@@ -465,7 +470,11 @@ class MCPSessionManager:
     3. Idle timeout for automatic session cleanup
     4. Periodic cleanup of stale sessions
     5. Transport preference caching to avoid retrying failed transports
+    6. Wait/queue mechanism when sessions are exhausted (prevents immediate failure)
     """
+
+    # Skip health check if session was validated within this many seconds
+    HEALTH_CHECK_GRACE_PERIOD = 5.0
 
     def __init__(self):
         # Structure: server_key -> {"sessions": {session_id: session_info}, "last_cleanup": timestamp}
@@ -478,7 +487,17 @@ class MCPSessionManager:
         # Cache which transport works for each server to avoid retrying failed transports
         # server_key -> "streamable_http" | "sse"
         self._transport_preference: dict[str, str] = {}
+        # Per-server locks to prevent race conditions in session creation
+        self._server_locks: dict[str, asyncio.Lock] = {}
+        # Lock for creating server-level locks
+        self._lock_lock = asyncio.Lock()
         self._cleanup_task = None
+        # Track last successful health check time per session to avoid redundant checks
+        self._last_health_check: dict[str, float] = {}
+        # Condition variables for waiting when sessions are exhausted (per server)
+        self._session_available: dict[str, asyncio.Condition] = {}
+        # Incrementing counter for unique session IDs per server (never decreases)
+        self._session_counter: dict[str, int] = {}
         self._start_cleanup_task()
 
     def _start_cleanup_task(self):
@@ -596,83 +615,246 @@ class MCPSessionManager:
         The key insight is that we should reuse sessions based on the server
         identity (command + args for stdio, URL for Streamable HTTP) rather than the context_id.
         This prevents creating a new subprocess for each unique context.
-        """
-        server_key = self._get_server_key(connection_params, transport_type)
 
-        # Ensure server entry exists
+        When all sessions are in use and we're at max capacity, this method will
+        wait for a session to become available rather than immediately evicting
+        or failing. This prevents connection errors under high concurrency.
+        """
+        import time
+        import sys
+
+        t0 = time.perf_counter()
+        print(f"[MCP-GS] START context={context_id} transport={transport_type}", file=sys.stderr, flush=True)
+        await logger.awarning(f"[GS] get_session START context={context_id} transport={transport_type}")
+
+        server_key = self._get_server_key(connection_params, transport_type)
+        wait_timeout = get_session_wait_timeout()
+        wait_start = asyncio.get_event_loop().time()
+
+        # Ensure server entry and condition variable exist
         if server_key not in self.sessions_by_server:
             self.sessions_by_server[server_key] = {"sessions": {}, "last_cleanup": asyncio.get_event_loop().time()}
 
-        server_data = self.sessions_by_server[server_key]
-        sessions = server_data["sessions"]
+        # Get or create lock and condition for this server
+        async with self._lock_lock:
+            if server_key not in self._server_locks:
+                self._server_locks[server_key] = asyncio.Lock()
+            if server_key not in self._session_available:
+                self._session_available[server_key] = asyncio.Condition(self._server_locks[server_key])
 
-        # Try to find a healthy existing session
-        for session_id, session_info in list(sessions.items()):
-            session = session_info["session"]
-            task = session_info["task"]
+        condition = self._session_available[server_key]
 
-            # Check if session is still alive
-            if not task.done():
-                # Update last used time
-                session_info["last_used"] = asyncio.get_event_loop().time()
+        # Variables for session creation outside lock
+        need_new_session = False
+        session_id: str | None = None
+        preferred_transport: str | None = None
 
-                # Quick health check
-                if await self._validate_session_connectivity(session):
-                    await logger.adebug(f"Reusing existing session {session_id} for server {server_key}")
-                    # record mapping & bump ref-count for backwards compatibility
-                    self._context_to_session[context_id] = (server_key, session_id)
-                    self._session_refcount[(server_key, session_id)] = (
-                        self._session_refcount.get((server_key, session_id), 0) + 1
+        # All session operations now inside condition (which wraps the lock)
+        print(f"[MCP-GS] LOCK_WAIT ctx={context_id[:20]}", file=sys.stderr, flush=True)
+        async with condition:
+            print(
+                f"[MCP-GS] LOCK_ACQ ctx={context_id[:20]} after {(time.perf_counter() - t0) * 1000:.0f}ms",
+                file=sys.stderr,
+                flush=True,
+            )
+            while True:
+                server_data = self.sessions_by_server[server_key]
+                sessions = server_data["sessions"]
+                current_time = asyncio.get_event_loop().time()
+
+                # Try to find a healthy existing session that is not in use
+                for sid, session_info in list(sessions.items()):
+                    # Skip pending sessions (being created by another request)
+                    if session_info.get("pending", False):
+                        continue
+
+                    session = session_info["session"]
+                    task = session_info["task"]
+
+                    # Check if session is still alive
+                    if task is not None and not task.done():
+                        # Skip if session is currently in use by another request
+                        if session_info.get("in_use", False):
+                            continue
+
+                        # Update last used time
+                        session_info["last_used"] = current_time
+
+                        # Skip health check if session was recently validated (within grace period)
+                        last_check = self._last_health_check.get(sid, 0)
+                        skip_health_check = current_time - last_check < self.HEALTH_CHECK_GRACE_PERIOD
+
+                        if skip_health_check:
+                            await logger.adebug(
+                                f"Reusing session {sid} (skipped health check, last check {current_time - last_check:.1f}s ago)"
+                            )
+                        elif await self._validate_session_connectivity(session):
+                            await logger.adebug(f"Reusing existing session {sid} for server {server_key}")
+                            self._last_health_check[sid] = current_time
+                        else:
+                            # Health check failed - clean up and continue to next session
+                            await logger.ainfo(
+                                f"Session {sid} for server {server_key} failed health check, cleaning up"
+                            )
+                            self._last_health_check.pop(sid, None)
+                            await self._cleanup_session_by_id(server_key, sid, already_locked=True)
+                            continue
+
+                        # Session is valid - mark as in use, register and return
+                        session_info["in_use"] = True
+                        self._context_to_session[context_id] = (server_key, sid)
+                        self._session_refcount[(server_key, sid)] = self._session_refcount.get((server_key, sid), 0) + 1
+                        print(
+                            f"[MCP-GS] REUSE session={sid} ctx={context_id[:20]} {(time.perf_counter() - t0) * 1000:.0f}ms",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        await logger.awarning(
+                            f"[GS] REUSING session {sid} after {(time.perf_counter() - t0) * 1000:.1f}ms"
+                        )
+                        return session
+                    elif task is not None:
+                        # Task is done, clean up
+                        await logger.ainfo(f"Session {sid} for server {server_key} task is done, cleaning up")
+                        self._last_health_check.pop(sid, None)
+                        await self._cleanup_session_by_id(server_key, sid, already_locked=True)
+
+                # Count non-pending sessions for capacity check
+                active_sessions = sum(1 for s in sessions.values() if not s.get("pending", False))
+                pending_sessions = sum(1 for s in sessions.values() if s.get("pending", False))
+
+                # Can we create a new session? (Check against max, considering pending slots)
+                if len(sessions) < get_max_sessions_per_server():
+                    # Reserve a slot for new session using incrementing counter (never collides)
+                    counter = self._session_counter.get(server_key, 0)
+                    session_id = f"{server_key}_{counter}"
+                    self._session_counter[server_key] = counter + 1
+                    print(
+                        f"[MCP-GS] NEW session={session_id} ctx={context_id[:20]} {(time.perf_counter() - t0) * 1000:.0f}ms",
+                        file=sys.stderr,
+                        flush=True,
                     )
-                    return session
-                await logger.ainfo(f"Session {session_id} for server {server_key} failed health check, cleaning up")
-                await self._cleanup_session_by_id(server_key, session_id)
-            else:
-                # Task is done, clean up
-                await logger.ainfo(f"Session {session_id} for server {server_key} task is done, cleaning up")
-                await self._cleanup_session_by_id(server_key, session_id)
+                    await logger.awarning(
+                        f"[GS] CREATING new session {session_id} after {(time.perf_counter() - t0) * 1000:.1f}ms"
+                    )
 
-        # Check if we've reached the maximum number of sessions for this server
-        if len(sessions) >= get_max_sessions_per_server():
-            # Remove the oldest session
-            oldest_session_id = min(sessions.keys(), key=lambda x: sessions[x]["last_used"])
-            await logger.ainfo(
-                f"Maximum sessions reached for server {server_key}, removing oldest session {oldest_session_id}"
-            )
-            await self._cleanup_session_by_id(server_key, oldest_session_id)
+                    # Add a placeholder to reserve the slot (prevents other requests from exceeding max)
+                    sessions[session_id] = {
+                        "session": None,
+                        "task": None,
+                        "type": transport_type,
+                        "last_used": asyncio.get_event_loop().time(),
+                        "in_use": True,  # Reserved
+                        "pending": True,  # Indicates creation in progress
+                    }
+                    preferred_transport = (
+                        self._transport_preference.get(server_key) if transport_type == "streamable_http" else None
+                    )
+                    need_new_session = True
+                    break  # Exit while loop to create session outside lock
 
-        # Create new session
-        session_id = f"{server_key}_{len(sessions)}"
-        await logger.ainfo(f"Creating new session {session_id} for server {server_key}")
+                # At max capacity and all sessions in use - wait for one to become available
+                in_use_count = sum(1 for s in sessions.values() if s.get("in_use", False))
+                print(
+                    f"[MCP-GS] WAIT ctx={context_id[:20]} pool={len(sessions)}/{get_max_sessions_per_server()} in_use={in_use_count} pending={pending_sessions}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                await logger.awarning(
+                    f"[GS] WAITING: sessions={len(sessions)}/{get_max_sessions_per_server()}, in_use={in_use_count}"
+                )
 
-        if transport_type == "stdio":
-            session, task = await self._create_stdio_session(session_id, connection_params)
-            actual_transport = "stdio"
-        elif transport_type == "streamable_http":
-            # Pass the cached transport preference if available
-            preferred_transport = self._transport_preference.get(server_key)
-            session, task, actual_transport = await self._create_streamable_http_session(
-                session_id, connection_params, preferred_transport
-            )
-            # Cache the transport that worked for future connections
-            self._transport_preference[server_key] = actual_transport
-        else:
-            msg = f"Unknown transport type: {transport_type}"
-            raise ValueError(msg)
+                waited = current_time - wait_start
+                if waited >= wait_timeout:
+                    msg = (
+                        f"Timeout waiting for MCP session after {waited:.1f}s "
+                        f"(server: {server_key}, sessions: {len(sessions)}/{get_max_sessions_per_server()})"
+                    )
+                    await logger.aerror(msg)
+                    raise ValueError(msg)
 
-        # Store session info with the actual transport used
-        sessions[session_id] = {
-            "session": session,
-            "task": task,
-            "type": actual_transport,
-            "last_used": asyncio.get_event_loop().time(),
-        }
+                remaining = wait_timeout - waited
+                print(f"All {len(sessions)} sessions in use for {server_key}, waiting up to {remaining:.1f}s...")
+                try:
+                    # Wait for notification or timeout (wake up periodically to recheck)
+                    await asyncio.wait_for(condition.wait(), timeout=min(remaining, 0.2))
+                except asyncio.TimeoutError:
+                    # Continue loop to retry or check wait timeout
+                    pass
+        # Lock is released here
 
-        # register mapping & initial ref-count for the new session
-        self._context_to_session[context_id] = (server_key, session_id)
-        self._session_refcount[(server_key, session_id)] = 1
+        # Create session OUTSIDE the lock to avoid blocking other requests
+        if need_new_session and session_id is not None:
+            print(f"[MCP-GS] CREATING_UNLOCKED session={session_id} ctx={context_id[:20]}", file=sys.stderr, flush=True)
+            try:
+                if transport_type == "stdio":
+                    session, task = await self._create_stdio_session(session_id, connection_params)
+                    actual_transport = "stdio"
+                elif transport_type == "streamable_http":
+                    session, task, actual_transport = await self._create_streamable_http_session(
+                        session_id, connection_params, preferred_transport
+                    )
+                else:
+                    msg = f"Unknown transport type: {transport_type}"
+                    raise ValueError(msg)
 
-        return session
+                # Re-acquire lock to register the session
+                async with condition:
+                    server_data = self.sessions_by_server[server_key]
+                    sessions = server_data["sessions"]
+
+                    # Update the placeholder with real session data
+                    sessions[session_id] = {
+                        "session": session,
+                        "task": task,
+                        "type": actual_transport,
+                        "last_used": asyncio.get_event_loop().time(),
+                        "in_use": True,
+                    }
+                    # Cache the transport that worked for future connections
+                    if transport_type == "streamable_http":
+                        self._transport_preference[server_key] = actual_transport
+
+                    # Record initial health check time for the new session
+                    self._last_health_check[session_id] = asyncio.get_event_loop().time()
+
+                    # register mapping & initial ref-count for the new session
+                    self._context_to_session[context_id] = (server_key, session_id)
+                    self._session_refcount[(server_key, session_id)] = 1
+
+                print(
+                    f"[MCP-GS] NEW_DONE session={session_id} ctx={context_id[:20]} {(time.perf_counter() - t0) * 1000:.0f}ms",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                await logger.ainfo(
+                    f"[GS] NEW session {session_id} ready after {(time.perf_counter() - t0) * 1000:.1f}ms"
+                )
+                return session
+
+            except BaseException as e:
+                # Creation failed or was cancelled - remove the placeholder and notify waiters
+                # Use BaseException to catch CancelledError which is not a subclass of Exception
+                print(
+                    f"[MCP-GS] CREATE_FAILED session={session_id} ctx={context_id[:20]} error={type(e).__name__}: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    async with condition:
+                        server_data = self.sessions_by_server[server_key]
+                        sessions = server_data["sessions"]
+                        sessions.pop(session_id, None)
+                        self._last_health_check.pop(session_id, None)
+                        # Notify waiters that a slot is now available
+                        condition.notify_all()
+                except Exception:
+                    pass  # Best effort cleanup
+                raise
+
+        # This should not be reached - defensive error
+        msg = f"get_session logic error: need_new_session={need_new_session}, session_id={session_id}"
+        raise ValueError(msg)
 
     async def _create_stdio_session(self, session_id: str, connection_params):
         """Create a new stdio session as a background task to avoid context issues."""
@@ -712,7 +894,7 @@ class MCPSessionManager:
 
         # Wait for session to be ready (use longer timeout for remote connections)
         try:
-            session = await asyncio.wait_for(session_future, timeout=30.0)
+            session = await asyncio.wait_for(session_future, timeout=50.0)
         except asyncio.TimeoutError as timeout_err:
             # Clean up the failed task
             if not task.done():
@@ -766,28 +948,41 @@ class MCPSessionManager:
 
         async def session_task():
             """Background task that keeps the session alive."""
+            import time
+
             streamable_error = None
+            task_start = time.monotonic()
+
+            def elapsed_ms() -> str:
+                return f"{(time.monotonic() - task_start) * 1000:.1f}ms"
 
             # Skip Streamable HTTP if we know SSE works for this server
             if preferred_transport != "sse":
                 # Try Streamable HTTP first with a quick timeout
                 try:
-                    await logger.adebug(f"Attempting Streamable HTTP connection for session {session_id}")
+                    print(f"[MCP-TASK] {session_id} START transport=streamable_http {elapsed_ms()}")
                     # Use a shorter timeout for the initial connection attempt (2 seconds)
+                    print(f"[MCP-TASK] {session_id} ENTERING_CLIENT_CTX {elapsed_ms()}")
                     async with streamablehttp_client(
                         url=connection_params["url"],
                         headers=connection_params["headers"],
                         timeout=connection_params["timeout_seconds"],
                         httpx_client_factory=custom_httpx_factory,
                     ) as (read, write, _):
+                        print(f"[MCP-TASK] {session_id} CLIENT_CTX_ENTERED {elapsed_ms()}")
                         session = ClientSession(read, write)
+                        print(f"[MCP-TASK] {session_id} CLIENT_SESSION_CREATED {elapsed_ms()}")
                         async with session:
+                            print(f"[MCP-TASK] {session_id} SESSION_CTX_ENTERED {elapsed_ms()}")
                             # Initialize with a timeout to fail fast
-                            await asyncio.wait_for(session.initialize(), timeout=2.0)
+                            print(f"[MCP-TASK] {session_id} CALLING_INITIALIZE {elapsed_ms()}")
+                            await asyncio.wait_for(session.initialize(), timeout=5.0)
+                            print(f"[MCP-TASK] {session_id} INITIALIZE_DONE {elapsed_ms()}")
                             used_transport.append("streamable_http")
                             await logger.ainfo(f"Session {session_id} connected via Streamable HTTP")
                             # Signal that session is ready
                             session_future.set_result(session)
+                            print(f"[MCP-TASK] {session_id} FUTURE_SET {elapsed_ms()}")
 
                             # Keep the session alive until cancelled
                             import anyio
@@ -796,24 +991,49 @@ class MCPSessionManager:
                             try:
                                 await event.wait()
                             except asyncio.CancelledError:
+                                print(f"[MCP-TASK] {session_id} CANCELLED {elapsed_ms()}")
                                 await logger.ainfo(f"Session {session_id} (Streamable HTTP) is shutting down")
+                                raise  # Re-raise to properly exit context managers
+                except asyncio.CancelledError:
+                    # Session was cancelled - this is expected during cleanup, don't fall back to SSE
+                    print(f"[MCP-TASK] {session_id} STREAMABLE_HTTP_CANCELLED_CLEAN {elapsed_ms()}")
+                    return
                 except (asyncio.TimeoutError, Exception) as e:  # noqa: BLE001
                     # If Streamable HTTP fails or times out, try SSE as fallback immediately
                     streamable_error = e
                     error_type = "timed out" if isinstance(e, asyncio.TimeoutError) else "failed"
+
+                    # Log ExceptionGroup sub-exceptions for debugging (recursively unwrap)
+                    def log_exception_group(eg: ExceptionGroup, prefix: str = "") -> None:
+                        for i, sub_exc in enumerate(eg.exceptions):
+                            if isinstance(sub_exc, ExceptionGroup):
+                                log_exception_group(sub_exc, f"{prefix}[{i}]")
+                            else:
+                                print(
+                                    f"[MCP-TASK] {session_id} STREAMABLE_HTTP_SUBEXC{prefix}[{i}] {type(sub_exc).__name__}: {sub_exc}"
+                                )
+
+                    if isinstance(e, ExceptionGroup):
+                        log_exception_group(e)
+                    print(
+                        f"[MCP-TASK] {session_id} STREAMABLE_HTTP_FAILED error={type(e).__name__}: {e} {elapsed_ms()}"
+                    )
                     await logger.awarning(
                         f"Streamable HTTP {error_type} for session {session_id}: {e}. Falling back to SSE..."
                     )
             else:
+                print(f"[MCP-TASK] {session_id} SKIP_STREAMABLE_HTTP using_sse_preference {elapsed_ms()}")
                 await logger.adebug(f"Skipping Streamable HTTP for session {session_id}, using cached SSE preference")
 
             # Try SSE if Streamable HTTP failed or if SSE is preferred
             if streamable_error is not None or preferred_transport == "sse":
                 try:
+                    print(f"[MCP-TASK] {session_id} START_SSE_FALLBACK {elapsed_ms()}")
                     await logger.adebug(f"Attempting SSE connection for session {session_id}")
                     # Extract SSE read timeout from connection params, default to 30s if not present
                     sse_read_timeout = connection_params.get("sse_read_timeout_seconds", 30)
 
+                    print(f"[MCP-TASK] {session_id} SSE_ENTERING_CLIENT_CTX {elapsed_ms()}")
                     async with sse_client(
                         connection_params["url"],
                         connection_params["headers"],
@@ -821,15 +1041,19 @@ class MCPSessionManager:
                         sse_read_timeout,
                         httpx_client_factory=custom_httpx_factory,
                     ) as (read, write):
+                        print(f"[MCP-TASK] {session_id} SSE_CLIENT_CTX_ENTERED {elapsed_ms()}")
                         session = ClientSession(read, write)
                         async with session:
+                            print(f"[MCP-TASK] {session_id} SSE_CALLING_INITIALIZE {elapsed_ms()}")
                             await session.initialize()
+                            print(f"[MCP-TASK] {session_id} SSE_INITIALIZE_DONE {elapsed_ms()}")
                             used_transport.append("sse")
                             fallback_msg = " (fallback)" if streamable_error else " (preferred)"
                             await logger.ainfo(f"Session {session_id} connected via SSE{fallback_msg}")
                             # Signal that session is ready
                             if not session_future.done():
                                 session_future.set_result(session)
+                            print(f"[MCP-TASK] {session_id} SSE_FUTURE_SET {elapsed_ms()}")
 
                             # Keep the session alive until cancelled
                             import anyio
@@ -838,9 +1062,18 @@ class MCPSessionManager:
                             try:
                                 await event.wait()
                             except asyncio.CancelledError:
+                                print(f"[MCP-TASK] {session_id} SSE_CANCELLED {elapsed_ms()}")
                                 await logger.ainfo(f"Session {session_id} (SSE) is shutting down")
+                                raise  # Re-raise to properly exit context managers
+                except asyncio.CancelledError:
+                    # Session was cancelled - this is expected during cleanup
+                    print(f"[MCP-TASK] {session_id} SSE_CANCELLED_CLEAN {elapsed_ms()}")
+                    return
                 except Exception as sse_error:  # noqa: BLE001
                     # Both transports failed (or just SSE if it was preferred)
+                    print(
+                        f"[MCP-TASK] {session_id} SSE_FAILED error={type(sse_error).__name__}: {sse_error} {elapsed_ms()}"
+                    )
                     if streamable_error:
                         await logger.aerror(
                             f"Both Streamable HTTP and SSE failed for session {session_id}. "
@@ -864,7 +1097,7 @@ class MCPSessionManager:
 
         # Wait for session to be ready (use longer timeout for remote connections)
         try:
-            session = await asyncio.wait_for(session_future, timeout=30.0)
+            session = await asyncio.wait_for(session_future, timeout=50.0)
             # Log which transport was used
             if used_transport:
                 transport_used = used_transport[0]
@@ -886,8 +1119,16 @@ class MCPSessionManager:
             await logger.aerror(msg)
             raise ValueError(msg) from timeout_err
 
-    async def _cleanup_session_by_id(self, server_key: str, session_id: str):
-        """Clean up a specific session by server key and session ID."""
+    async def _cleanup_session_by_id(self, server_key: str, session_id: str, *, already_locked: bool = False):
+        """Clean up a specific session by server key and session ID.
+
+        After cleanup, notifies any waiters that a session slot is now available.
+
+        Args:
+            server_key: The server key
+            session_id: The session ID to clean up
+            already_locked: If True, caller already holds the condition lock (avoids deadlock)
+        """
         if server_key not in self.sessions_by_server:
             return
 
@@ -950,8 +1191,75 @@ class MCPSessionManager:
         except Exception as e:  # noqa: BLE001
             await logger.awarning(f"Error cleaning up session {session_id}: {e}")
         finally:
-            # Remove from sessions dict
-            del sessions[session_id]
+            # Remove from sessions dict (safe if already removed by concurrent cleanup)
+            sessions.pop(session_id, None)
+            # Clear health check cache for this session
+            self._last_health_check.pop(session_id, None)
+            # Notify any waiters that a session slot is now available
+            await self._notify_session_available(server_key, already_locked=already_locked)
+
+    async def release_session(self, context_id: str):
+        """Release a session back to the pool after use.
+
+        Decrements the refcount for this context's session and marks it as not in use.
+        Call this when done with a session obtained from get_session().
+        """
+        import sys
+
+        mapping = self._context_to_session.get(context_id)
+        if not mapping:
+            print(f"[MCP-REL] NO_MAP ctx={context_id[:30]}", file=sys.stderr, flush=True)
+            await logger.adebug(f"No session mapping found for context_id {context_id} during release")
+            return
+
+        server_key, session_id = mapping
+        ref_key = (server_key, session_id)
+
+        # Decrement refcount (symmetric with get_session increment)
+        remaining = self._session_refcount.get(ref_key, 1) - 1
+        if remaining <= 0:
+            self._session_refcount.pop(ref_key, None)
+        else:
+            self._session_refcount[ref_key] = remaining
+
+        # Remove the context mapping (this context is done with the session)
+        self._context_to_session.pop(context_id, None)
+
+        # Mark session as not in use (available for other requests)
+        if server_key in self.sessions_by_server:
+            server_data = self.sessions_by_server[server_key]
+            sessions = server_data.get("sessions", {})
+            if session_id in sessions:
+                sessions[session_id]["in_use"] = False
+                in_use_count = sum(1 for s in sessions.values() if s.get("in_use", False))
+                print(
+                    f"[MCP-REL] OK session={session_id[-15:]} ctx={context_id[:20]} ref={remaining} pool={in_use_count}/{len(sessions)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                await logger.adebug(f"Released session {session_id} for server {server_key} (refcount: {remaining})")
+
+        # Notify waiters that a session is available
+        await self._notify_session_available(server_key)
+
+    async def _notify_session_available(self, server_key: str, *, already_locked: bool = False):
+        """Notify waiters that a session slot may be available.
+
+        Args:
+            server_key: The server key to notify for
+            already_locked: If True, caller already holds the condition lock (avoids deadlock)
+        """
+        import sys
+
+        condition = self._session_available.get(server_key)
+        if condition:
+            print(f"[MCP-NOTIFY] notify_all key={server_key[:40]}", file=sys.stderr, flush=True)
+            if already_locked:
+                # Caller already holds the lock, just notify
+                condition.notify_all()
+            else:
+                async with condition:
+                    condition.notify_all()  # Wake ALL waiters, not just one
 
     async def cleanup_all(self):
         """Clean up all sessions."""
@@ -980,6 +1288,7 @@ class MCPSessionManager:
         # Clear compatibility maps
         self._context_to_session.clear()
         self._session_refcount.clear()
+        self._last_health_check.clear()
 
         # Clear all background tasks
         for task in list(self._background_tasks):
@@ -1061,10 +1370,21 @@ class MCPStdioClient:
             self._session_context = f"default_{param_hash}"
 
         # Get or create a persistent session
-        session = await self._get_or_create_session()
-        response = await session.list_tools()
-        self._connected = True
-        return response.tools
+        session = None
+        try:
+            session = await self._get_or_create_session()
+            response = await session.list_tools()
+            self._connected = True
+            return response.tools
+        finally:
+            # Release session back to pool after listing tools
+            # This ensures the session is available for run_tool() or other requests
+            if self._session_context and session is not None:
+                try:
+                    session_manager = self._get_session_manager()
+                    await session_manager.release_session(self._session_context)
+                except BaseException:  # noqa: BLE001
+                    pass  # Best effort release
 
     async def connect_to_server(self, command_str: str, env: dict[str, str] | None = None) -> list[StructuredTool]:
         """Connect to MCP server using stdio transport (SDK style)."""
@@ -1131,6 +1451,7 @@ class MCPStdioClient:
         last_error_type = None
 
         for attempt in range(max_retries):
+            session = None
             try:
                 await logger.adebug(f"Attempting to run tool '{tool_name}' (attempt {attempt + 1}/{max_retries})")
                 # Get or create persistent session
@@ -1202,6 +1523,16 @@ class MCPStdioClient:
             else:
                 await logger.adebug(f"Tool '{tool_name}' completed successfully")
                 return result
+            finally:
+                # Always release session back to pool - handles success, Exception, AND CancelledError
+                # CancelledError is a BaseException (not Exception), so it bypasses except blocks
+                # but finally always runs, preventing session leaks on task cancellation
+                if self._session_context:
+                    try:
+                        session_manager = self._get_session_manager()
+                        await session_manager.release_session(self._session_context)
+                    except Exception:  # noqa: BLE001
+                        pass  # Best effort release
 
         # This should never be reached due to the exception handling above
         msg = f"Failed to run tool '{tool_name}': Maximum retries exceeded with repeated {last_error_type} errors"
@@ -1310,10 +1641,21 @@ class MCPStreamableHttpClient:
             self._session_context = f"default_http_{param_hash}"
 
         # Get or create a persistent session (will try Streamable HTTP, then SSE fallback)
-        session = await self._get_or_create_session()
-        response = await session.list_tools()
-        self._connected = True
-        return response.tools
+        session = None
+        try:
+            session = await self._get_or_create_session()
+            response = await session.list_tools()
+            self._connected = True
+            return response.tools
+        finally:
+            # Always release session back to pool - runs on success, exception, AND return
+            # The else block was unreachable because try ends with return statement
+            if self._session_context and session is not None:
+                try:
+                    session_manager = self._get_session_manager()
+                    await session_manager.release_session(self._session_context)
+                except BaseException:  # noqa: BLE001
+                    pass  # Best effort release
 
     async def connect_to_server(
         self,
@@ -1324,12 +1666,35 @@ class MCPStreamableHttpClient:
         verify_ssl: bool = True,
     ) -> list[StructuredTool]:
         """Connect to MCP server using Streamable HTTP with SSE fallback transport (SDK style)."""
-        return await asyncio.wait_for(
-            self._connect_to_server(
-                url, headers, sse_read_timeout_seconds=sse_read_timeout_seconds, verify_ssl=verify_ssl
-            ),
-            timeout=get_settings_service().settings.mcp_server_timeout,
+        import time
+
+        t0 = time.perf_counter()
+        timeout_val = get_settings_service().settings.mcp_server_timeout
+        await logger.ainfo(
+            f"[CTS] connect_to_server START url={url} timeout={timeout_val}s context={self._session_context}"
         )
+        try:
+            result = await asyncio.wait_for(
+                self._connect_to_server(
+                    url, headers, sse_read_timeout_seconds=sse_read_timeout_seconds, verify_ssl=verify_ssl
+                ),
+                timeout=timeout_val,
+            )
+            await logger.ainfo(
+                f"[CTS] connect_to_server SUCCESS after {(time.perf_counter() - t0) * 1000:.1f}ms, got {len(result)} tools"
+            )
+            return result
+        except asyncio.TimeoutError as e:
+            await logger.aerror(f"[CTS] connect_to_server TIMEOUT after {(time.perf_counter() - t0) * 1000:.1f}ms")
+            raise
+        except asyncio.CancelledError as e:
+            await logger.aerror(f"[CTS] connect_to_server CANCELLED after {(time.perf_counter() - t0) * 1000:.1f}ms")
+            raise
+        except Exception as e:
+            await logger.aerror(
+                f"[CTS] connect_to_server FAILED after {(time.perf_counter() - t0) * 1000:.1f}ms: {type(e).__name__}: {e}"
+            )
+            raise
 
     def set_session_context(self, context_id: str):
         """Set the session context (e.g., flow_id + user_id + session_id)."""
@@ -1403,6 +1768,7 @@ class MCPStreamableHttpClient:
         last_error_type = None
 
         for attempt in range(max_retries):
+            session = None
             try:
                 await logger.adebug(f"Attempting to run tool '{tool_name}' (attempt {attempt + 1}/{max_retries})")
                 # Get or create persistent session
@@ -1477,6 +1843,16 @@ class MCPStreamableHttpClient:
             else:
                 await logger.adebug(f"Tool '{tool_name}' completed successfully")
                 return result
+            finally:
+                # Always release session back to pool - handles success, Exception, AND CancelledError
+                # CancelledError is a BaseException (not Exception), so it bypasses except blocks
+                # but finally always runs, preventing session leaks on task cancellation
+                if self._session_context:
+                    try:
+                        session_manager = self._get_session_manager()
+                        await session_manager.release_session(self._session_context)
+                    except Exception:  # noqa: BLE001
+                        pass  # Best effort release
 
         # This should never be reached due to the exception handling above
         msg = f"Failed to run tool '{tool_name}': Maximum retries exceeded with repeated {last_error_type} errors"
