@@ -762,7 +762,7 @@
                   },
                   {
                     "name": "langchain_openai",
-                    "version": "0.3.35"
+                    "version": "0.3.23"
                   },
                   {
                     "name": "langchain_huggingface",
@@ -770,7 +770,7 @@
                   },
                   {
                     "name": "langchain_cohere",
-                    "version": "0.4.6"
+                    "version": "0.3.5"
                   }
                 ],
                 "total_dependencies": 8
