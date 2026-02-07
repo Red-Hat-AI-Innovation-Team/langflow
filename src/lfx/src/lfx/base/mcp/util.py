@@ -976,7 +976,7 @@ class MCPSessionManager:
                             print(f"[MCP-TASK] {session_id} SESSION_CTX_ENTERED {elapsed_ms()}")
                             # Initialize with a timeout to fail fast
                             print(f"[MCP-TASK] {session_id} CALLING_INITIALIZE {elapsed_ms()}")
-                            await asyncio.wait_for(session.initialize(), timeout=5.0)
+                            await asyncio.wait_for(session.initialize(), timeout=8.0)
                             print(f"[MCP-TASK] {session_id} INITIALIZE_DONE {elapsed_ms()}")
                             used_transport.append("streamable_http")
                             await logger.ainfo(f"Session {session_id} connected via Streamable HTTP")
