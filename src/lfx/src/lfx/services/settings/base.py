@@ -99,9 +99,10 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     # MCP Session-manager tuning
     # ---------------------------------------------------------------------
-    mcp_max_sessions_per_server: int = 200
+    mcp_max_sessions_per_server: int = 20
     """Maximum number of MCP sessions to keep per unique server (command/url).
-    Requests queue when at capacity."""
+    Requests queue when at capacity. Reduced from 200 to 20 to prevent file
+    descriptor exhaustion (each session uses ~2-3 FDs, macOS default limit is 256)."""
 
     mcp_session_wait_timeout: int = 30  # seconds
     """Maximum time (in seconds) to wait for a session to become available
