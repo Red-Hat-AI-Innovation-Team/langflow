@@ -7,6 +7,7 @@ import { nanoid } from "nanoid";
 import { useEffect, useState } from "react";
 import { ForwardedIconComponent } from "@/components/common/genericIconComponent";
 import ShadTooltip from "@/components/common/shadTooltipComponent";
+import InputGlobalComponent from "@/components/core/parameterRenderComponent/components/inputGlobalComponent";
 import InputListComponent from "@/components/core/parameterRenderComponent/components/inputListComponent";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -103,6 +104,7 @@ export default function AddMcpServerModal({
     setStdioEnv([{ key: "", value: "", id: nanoid(), error: false }]);
     setHttpName("");
     setHttpUrl("");
+    setHttpUrlLoadFromDb(false);
     setHttpEnv([{ key: "", value: "", id: nanoid(), error: false }]);
     setHttpHeaders([{ key: "", value: "", id: nanoid(), error: false }]);
   };
@@ -120,6 +122,7 @@ export default function AddMcpServerModal({
   // HTTP state
   const [httpName, setHttpName] = useState(initialData?.name || "");
   const [httpUrl, setHttpUrl] = useState(initialData?.url || "");
+  const [httpUrlLoadFromDb, setHttpUrlLoadFromDb] = useState(false);
   const [httpEnv, setHttpEnv] = useState<KeyPairRow[]>(
     objectToKeyPairRow(initialData?.env) || [],
   );
@@ -138,6 +141,7 @@ export default function AddMcpServerModal({
       setStdioEnv(objectToKeyPairRow(initialData?.env) || []);
       setHttpName(initialData?.name || "");
       setHttpUrl(initialData?.url || "");
+      setHttpUrlLoadFromDb(false);
       setHttpEnv(objectToKeyPairRow(initialData?.env) || []);
       setHttpHeaders(objectToKeyPairRow(initialData?.headers) || []);
     }
@@ -217,6 +221,7 @@ export default function AddMcpServerModal({
         setOpen(false);
         setHttpName("");
         setHttpUrl("");
+        setHttpUrlLoadFromDb(false);
         setHttpEnv([{ key: "", value: "", id: nanoid(), error: false }]);
         setHttpHeaders([{ key: "", value: "", id: nanoid(), error: false }]);
         setError(null);
@@ -425,12 +430,19 @@ export default function AddMcpServerModal({
                         Streamable HTTP/SSE URL
                         <span className="text-red-500">*</span>
                       </Label>
-                      <Input
+                      <InputGlobalComponent
+                        display_name="Streamable HTTP/SSE URL"
                         value={httpUrl}
-                        onChange={(e) => setHttpUrl(e.target.value)}
-                        placeholder="Streamable HTTP/SSE URL"
-                        data-testid="http-url-input"
+                        load_from_db={httpUrlLoadFromDb}
+                        handleOnNewValue={(newValue) => {
+                          setHttpUrl(newValue.value);
+                          setHttpUrlLoadFromDb(newValue.load_from_db ?? false);
+                        }}
+                        placeholder="Streamable HTTP/SSE URL or variable name"
+                        id="http-url-input"
                         disabled={isPending}
+                        editNode={false}
+                        password={false}
                       />
                     </div>
                     <div className="flex flex-col gap-2">

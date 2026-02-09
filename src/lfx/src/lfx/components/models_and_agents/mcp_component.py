@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 
 from langchain_core.tools import StructuredTool  # noqa: TC002
@@ -19,7 +20,7 @@ from lfx.io.schema import flatten_schema, schema_to_langflow_inputs
 from lfx.log.logger import logger
 from lfx.schema.dataframe import DataFrame
 from lfx.schema.message import Message
-from lfx.services.deps import get_settings_service, get_storage_service, session_scope
+from lfx.services.deps import get_settings_service, get_storage_service, get_variable_service, session_scope
 
 
 def _try_parse_value(value):
@@ -168,6 +169,57 @@ class MCPToolsComponent(ComponentWithCache):
         except Exception as e:
             await logger.aerror(f"OAuth failed: {e}")
             return None
+
+    async def _resolve_mcp_url_variable(self, url: str, session) -> str:
+        """Resolve MCP server URL from environment variable or variable service.
+
+        For MCP servers, environment variables take priority over database variables.
+        If the URL doesn't look like a variable name (i.e., it looks like an actual URL),
+        it's returned as-is.
+
+        Args:
+            url: The URL value which may be an actual URL or a variable name
+            session: Database session for variable service lookup
+
+        Returns:
+            The resolved URL value
+        """
+        if not url:
+            return url
+
+        # If it looks like a URL (has scheme), return as-is
+        if url.startswith(("http://", "https://")):
+            return url
+
+        # Treat as a variable name - check environment first (MCP prefers env vars)
+        env_value = os.environ.get(url)
+        if env_value:
+            await logger.ainfo(f"Resolved MCP URL from environment variable: {url}")
+            return env_value
+
+        # Fall back to variable service (database)
+        try:
+            variable_service = get_variable_service()
+            if variable_service and self.user_id:
+                if isinstance(self.user_id, str):
+                    user_id = uuid.UUID(self.user_id)
+                else:
+                    user_id = self.user_id
+                db_value = await variable_service.get_variable(
+                    user_id=user_id, name=url, field="url", session=session
+                )
+                if db_value:
+                    await logger.ainfo(f"Resolved MCP URL from variable service: {url}")
+                    return db_value
+        except Exception as e:
+            await logger.adebug(f"Could not resolve URL variable '{url}' from variable service: {e}")
+
+        # Return original value if not resolved (might be an invalid URL or unset variable)
+        await logger.awarning(
+            f"MCP URL '{url}' could not be resolved from environment or variable service. "
+            "Using as-is."
+        )
+        return url
 
     default_keys: list[str] = [
         "code",
@@ -373,10 +425,21 @@ class MCPToolsComponent(ComponentWithCache):
                 self.tools = []
                 return [], {"name": server_name, "config": server_config}
 
-            # Add verify_ssl option to server config if not present
-            if "verify_ssl" not in server_config:
+            # Create a working copy of the config for connection
+            # Keep the original config unchanged for storage/export
+            connection_config = dict(server_config)
+
+            # Resolve URL from environment variable or variable service
+            # For MCP, environment variables take priority over database variables
+            if "url" in connection_config and connection_config["url"]:
+                async with session_scope() as db:
+                    resolved_url = await self._resolve_mcp_url_variable(connection_config["url"], db)
+                    connection_config["url"] = resolved_url
+
+            # Add verify_ssl option to connection config if not present
+            if "verify_ssl" not in connection_config:
                 verify_ssl = getattr(self, "verify_ssl", True)
-                server_config["verify_ssl"] = verify_ssl
+                connection_config["verify_ssl"] = verify_ssl
 
             # Inject OAuth Authorization header if enabled (HTTP mode only)
             enable_oauth = getattr(self, "enable_oauth", False)
@@ -394,22 +457,22 @@ class MCPToolsComponent(ComponentWithCache):
             await logger.ainfo(
                 f"OAuth status for {server_name}: enabled={enable_oauth}, "
                 f"token_present={oauth_token is not None}, "
-                f"url={server_config.get('url', 'N/A')}"
+                f"url={connection_config.get('url', 'N/A')}"
             )
 
             if enable_oauth and oauth_token:
                 # Only inject for HTTP-based servers (not Stdio)
-                mode = server_config.get("mode", "")
+                mode = connection_config.get("mode", "")
                 is_http_mode = mode in ("Streamable_HTTP", "SSE") or (
-                    "url" in server_config and "command" not in server_config
+                    "url" in connection_config and "command" not in connection_config
                 )
                 if is_http_mode:
-                    if "headers" not in server_config:
-                        server_config["headers"] = {}
-                    server_config["headers"]["Authorization"] = f"Bearer {oauth_token}"
+                    if "headers" not in connection_config:
+                        connection_config["headers"] = {}
+                    connection_config["headers"]["Authorization"] = f"Bearer {oauth_token}"
                     await logger.ainfo(
                         f"OAuth Authorization header injected into MCP config for URL: "
-                        f"{server_config.get('url', 'unknown')}"
+                        f"{connection_config.get('url', 'unknown')}"
                     )
                 else:
                     await logger.awarning("OAuth enabled but server is not HTTP-based, skipping header injection")
@@ -420,7 +483,7 @@ class MCPToolsComponent(ComponentWithCache):
                 )
                 _, tool_list, tool_cache = await update_tools(
                     server_name=server_name,
-                    server_config=server_config,
+                    server_config=connection_config,
                     mcp_stdio_client=self.stdio_client,
                     mcp_streamable_http_client=self.streamable_http_client,
                 )

@@ -1,5 +1,6 @@
 import contextlib
 import json
+import os
 from io import BytesIO
 from typing import Annotated
 
@@ -156,9 +157,20 @@ async def get_servers(
         mcp_stdio_client = MCPStdioClient()
         mcp_streamable_http_client = MCPStreamableHttpClient()
         try:
+            # Get a copy of the server config to avoid mutating the original
+            server_config = dict(server_list["mcpServers"][server_name])
+
+            # Resolve URL from environment variable if it's not a URL
+            if "url" in server_config and server_config["url"]:
+                url = server_config["url"]
+                if not url.startswith(("http://", "https://")):
+                    env_value = os.environ.get(url)
+                    if env_value:
+                        server_config["url"] = env_value
+
             mode, tool_list, _ = await update_tools(
                 server_name=server_name,
-                server_config=server_list["mcpServers"][server_name],
+                server_config=server_config,
                 mcp_stdio_client=mcp_stdio_client,
                 mcp_streamable_http_client=mcp_streamable_http_client,
             )
